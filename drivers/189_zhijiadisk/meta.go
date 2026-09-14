@@ -11,6 +11,11 @@ type Addition struct {
 	AccessToken string `json:"access_token" help:"可留空。填入后跳过账号密码登录"`
 	driver.RootPath
 	UploadThread int `json:"upload_thread" type:"number" default:"3" help:"并发分块上传数，1-8"`
+
+	// ForwardUrl 由登录/用户信息接口返回，上传下载走这个域名。
+	// 故意不带 json tag：getAdditionalItems 会跳过无 tag 字段，
+	// 这样它不会出现在添加存储的表单里，但仍会被持久化。
+	ForwardUrl string
 }
 
 var config = driver.Config{
