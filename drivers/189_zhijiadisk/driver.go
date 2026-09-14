@@ -2,13 +2,18 @@ package zhijiadisk
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/cookiejar"
+	"net/url"
+	"sync"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -29,6 +34,9 @@ type ZhiJiaDisk struct {
 	// client 带 cookie jar：上游会在响应里下发会话 cookie，
 	// 交给 jar 自动维护，避免每次请求都重新协商。
 	client *resty.Client
+
+	// authMu 串行化「重新登录 / 刷新会话」，避免并发请求同时触发多轮登录。
+	authMu sync.Mutex
 }
 
 func (d *ZhiJiaDisk) Config() driver.Config {
@@ -48,12 +56,19 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 	}
 	d.client = base.NewRestyClient().SetCookieJar(jar)
 
+	// 回填上次持久化的会话 cookie，尽量免去重新登录
+	d.restoreCookies()
+
 	if d.UploadThread <= 0 {
 		d.UploadThread = 3
 	} else if d.UploadThread > 8 {
 		d.UploadThread = 8
 	}
 
+	// 已有 access_token 就直接用；否则登录。
+	// 注意 persistURLs 依赖 forwardUrl，此时它通常还是空的（首次配置时
+	// 靠下面 refreshUserInfo 才拿到），所以恢复的 cookie 会先全部落在
+	// apiBase 上；refreshUserInfo 之后会按真实 forwardUrl 再存一次。
 	if d.AccessToken == "" {
 		if d.Mobile == "" {
 			return errs.EmptyUsername
@@ -62,14 +77,54 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 			return errs.EmptyPassword
 		}
 		if err := d.login(ctx); err != nil {
-			return err
+			// 有持久化的会话 cookie 时，即使密码登录失败也能凭 cookie 继续
+			// （例如密码已改）。此时不再向上报错，交给后续请求自愈。
+			if !d.hasCookies() {
+				return err
+			}
+			utils.Log.Warnf("[zhi] login failed, fallback to persisted cookies: %v", err)
 		}
 		op.MustSaveDriverStorage(d)
 	}
-	return d.refreshUserInfo(ctx)
+	if err := d.refreshUserInfo(ctx); err != nil {
+		return err
+	}
+	// 到这里 forwardUrl 已就绪，把 cookie 按正确的域名作用域重新回填并落库，
+	// 否则下次启动 persistURLs 仍拿不到 forwardUrl，cookie 会被丢在错误的 host 下。
+	d.regraftCookies()
+	if d.saveCookies() {
+		op.MustSaveDriverStorage(d)
+	}
+	return nil
+}
+
+// regraftCookies 在 forwardUrl 就绪后，把已持久化的 cookie 重新回填到
+// 正确的作用域上。Init 早期 forwardUrl 为空，jar 里只认 apiBase，
+// 这里补上 forwardUrl 对应的 host。
+func (d *ZhiJiaDisk) regraftCookies() {
+	if d.Addition.Cookies == "" || d.forwardUrl() == "" {
+		return
+	}
+	var cookies []*http.Cookie
+	if err := json.Unmarshal([]byte(d.Addition.Cookies), &cookies); err != nil || len(cookies) == 0 {
+		return
+	}
+	jar := d.client.GetClient().CookieJar
+	if jar == nil {
+		return
+	}
+	if u, err := url.Parse(d.forwardUrl()); err == nil {
+		jar.SetCookies(u, cookies)
+	}
 }
 
 func (d *ZhiJiaDisk) Drop(ctx context.Context) error {
+	d.authMu.Lock()
+	// 停用/重载时尽量把会话 cookie 存下来
+	if d.saveCookies() {
+		op.MustSaveDriverStorage(d)
+	}
+	d.authMu.Unlock()
 	return nil
 }
 

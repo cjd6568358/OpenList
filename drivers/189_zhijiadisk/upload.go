@@ -1,11 +1,13 @@
 package zhijiadisk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -84,48 +86,61 @@ func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.Fi
 				if utils.IsCanceled(ctx) {
 					return ctx.Err()
 				}
-				reader, err := ss.GetSectionReader(offset, length)
-				if err != nil {
-					return err
-				}
-				defer ss.FreeSectionReader(reader)
+				// 鉴权失效时刷新会话再重传这一块。
+				// 下面这段会整体重跑，所以 body 必须在每次尝试时重新申请，
+				// 否则第二次尝试会读到已耗尽的 reader。
+				err := d.withRelogin(ctx, func() error {
+					reader, err := ss.GetSectionReader(offset, length)
+					if err != nil {
+						return err
+					}
+					defer ss.FreeSectionReader(reader)
 
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadUrl, nil)
-				if err != nil {
-					return err
-				}
-				// 分块参数：每一块都带 .crash 后缀与自身 offset
-				q := req.URL.Query()
-				q.Set("uploadToken", token)
-				q.Set("fileName", name+".crash")
-				q.Set("directory", dir)
-				q.Set("offset", strconv.FormatInt(offset, 10))
-				req.URL.RawQuery = q.Encode()
+					body, err := io.ReadAll(reader)
+					if err != nil {
+						return err
+					}
+					if int64(len(body)) != length {
+						return fmt.Errorf("chunk %d: short read, want %d got %d", index, length, len(body))
+					}
 
-				for k, v := range d.authHeaders() {
-					req.Header.Set(k, v)
-				}
-				req.Header.Set("Content-Type", "application/octet-stream")
-				req.ContentLength = length
-				// 直接用限速 reader 作 body；ContentLength 已显式设置，
-				// 否则 Go 无法为这种非 bytes/strings reader 推断长度
-				req.Body = driver.NewLimitedUploadStream(ctx, reader)
+					q := url.Values{}
+					q.Set("uploadToken", token)
+					q.Set("fileName", name+".crash")
+					q.Set("directory", dir)
+					q.Set("offset", strconv.FormatInt(offset, 10))
+					reqUrl := uploadUrl + "?" + q.Encode()
 
-				res, err := base.HttpClient.Do(req)
-				if err != nil {
-					return err
-				}
-				defer res.Body.Close()
-				body, _ := io.ReadAll(res.Body)
-				if res.StatusCode != 200 {
-					return fmt.Errorf("chunk %d upload failed: HTTP %d, body: %s",
-						index, res.StatusCode, string(body))
-				}
-				// 成功判断：code==200 且内层 result=="successful"
-				if err := checkChunkResult(body); err != nil {
-					return fmt.Errorf("chunk %d: %w", index, err)
-				}
-				return nil
+					req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqUrl, bytes.NewReader(body))
+					if err != nil {
+						return err
+					}
+					for k, v := range d.authHeaders() {
+						req.Header.Set(k, v)
+					}
+					req.Header.Set("Content-Type", "application/octet-stream")
+					req.ContentLength = length
+					// 走限速 reader；ContentLength 已显式设置，
+					// 否则 Go 无法为这种非 bytes/strings reader 推断长度
+					req.Body = driver.NewLimitedUploadStream(ctx, bytes.NewReader(body))
+
+					res, err := base.HttpClient.Do(req)
+					if err != nil {
+						return err
+					}
+					defer res.Body.Close()
+					respBody, _ := io.ReadAll(res.Body)
+					if res.StatusCode != 200 {
+						return fmt.Errorf("chunk %d upload failed: HTTP %d, body: %s",
+							index, res.StatusCode, string(respBody))
+					}
+					// 成功判断：code==200 且内层 result=="successful"
+					if err := checkChunkResult(respBody); err != nil {
+						return fmt.Errorf("chunk %d: %w", index, err)
+					}
+					return nil
+				})
+				return err
 			},
 		})
 	}

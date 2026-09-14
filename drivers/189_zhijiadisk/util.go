@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path"
 	"strconv"
@@ -11,7 +12,10 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 // nasProxy 的 method 常量（对应小程序 config/nas.js）
@@ -30,6 +34,40 @@ const (
 	uploadTypeUpload   = 0
 	uploadTypeDownload = 1
 )
+
+// 鉴权失效的识别。上游把「token 过期」表示为 code 1009/1011 或 msg 里的文案，
+// 这里按同样的口径判定，命中则触发会话恢复。
+var authFailureCodes = []int{1009, 1011, 401}
+
+var authFailureMarkers = []string{
+	"token expired",
+	"token过期",
+	"upload/download token expired",
+	"登录已过期",
+	"未登录",
+}
+
+// isAuthFailure 判断错误是否属于「会话失效、可自动恢复」
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, c := range authFailureCodes {
+		if strings.Contains(msg, strconv.Itoa(c)) {
+			// code 以「code 1009」形式出现，避免误伤正文里恰好含这些数字的情况
+			if strings.Contains(msg, "code "+strconv.Itoa(c)) {
+				return true
+			}
+		}
+	}
+	for _, m := range authFailureMarkers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
 
 // ==================== 家庭共享（homeshare）处理 ====================
 //
@@ -146,6 +184,141 @@ func (d *ZhiJiaDisk) forwardUrl() string {
 	return strings.TrimSuffix(d.Addition.ForwardUrl, "/")
 }
 
+// ==================== 会话 cookie 持久化 ====================
+//
+// 登录态实际由 cookie 维持：token 失效（1009）时上游是**不带密码**重取用户信息恢复的，
+// 说明会话上下文在 cookie 里。只把 jar 放内存，进程一重启就丢，会话随之失效。
+// 这里把 jar 序列化进 Addition，随存储配置一起落库。
+
+// persistURLs 是 jar 的“作用域种子”。jar 以 host 为键收集 cookie，
+// 恢复时得先知道该往哪些 host 回填 —— 这两个正是本驱动会访问的域名。
+func (d *ZhiJiaDisk) persistURLs() []*url.URL {
+	urls := make([]*url.URL, 0, 2)
+	for _, raw := range []string{apiBase, d.forwardUrl()} {
+		if raw == "" {
+			continue
+		}
+		if u, err := url.Parse(raw); err == nil {
+			urls = append(urls, u)
+		}
+	}
+	return urls
+}
+
+// hasCookies 是否已有可复用的会话 cookie
+func (d *ZhiJiaDisk) hasCookies() bool {
+	return d.Addition.Cookies != "" && len(d.persistURLs()) > 0
+}
+
+// saveCookies 把 jar 内容序列化进 Addition。
+// 返回是否有变化，避免每次请求都写库。
+func (d *ZhiJiaDisk) saveCookies() bool {
+	if d.client == nil || d.client.GetClient() == nil {
+		return false
+	}
+	jar := d.client.GetClient().CookieJar
+	if jar == nil {
+		return false
+	}
+	var all []*http.Cookie
+	for _, u := range d.persistURLs() {
+		all = append(all, jar.Cookies(u)...)
+	}
+	if len(all) == 0 {
+		return false
+	}
+	// 用 cookiejar.Options 同款 JSON 编码，便于跨版本稳定
+	encoded, err := json.Marshal(all)
+	if err != nil {
+		return false
+	}
+	if string(encoded) == d.Addition.Cookies {
+		return false
+	}
+	d.Addition.Cookies = string(encoded)
+	return true
+}
+
+// restoreCookies 在 Init 时把上次存的 cookie 回填进 jar。
+// 内容损坏时静默跳过并清空，退化为重新登录，不影响可用性。
+func (d *ZhiJiaDisk) restoreCookies() {
+	if d.Addition.Cookies == "" {
+		return
+	}
+	var cookies []*http.Cookie
+	if err := json.Unmarshal([]byte(d.Addition.Cookies), &cookies); err != nil {
+		utils.Log.Warnf("[zhi] restore cookies failed, will login again: %v", err)
+		d.Addition.Cookies = ""
+		return
+	}
+	if len(cookies) == 0 {
+		return
+	}
+	jar := d.client.GetClient().CookieJar
+	if jar == nil {
+		return
+	}
+	for _, u := range d.persistURLs() {
+		jar.SetCookies(u, cookies)
+	}
+}
+
+// relogin 在业务请求因鉴权失效失败时恢复会话，全程无用户介入。
+// 顺序与上游一致：先用会话 cookie 重取用户信息（不带密码），
+// 不行再用已存密码重新登录。
+func (d *ZhiJiaDisk) relogin(ctx context.Context) error {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+
+	if d.hasCookies() {
+		if err := d.refreshSession(ctx); err == nil {
+			return nil
+		} else {
+			utils.Log.Warnf("[zhi] refresh session with cookies failed: %v", err)
+		}
+	}
+	if d.Mobile == "" || d.Password == "" {
+		return errs.EmptyPassword
+	}
+	if err := d.login(ctx); err != nil {
+		return err
+	}
+	if err := d.refreshUserInfo(ctx); err != nil {
+		return err
+	}
+	op.MustSaveDriverStorage(d)
+	return nil
+}
+
+// withRelogin 执行 fn；判定为鉴权失效时恢复会话并重试一次。
+//
+// 注意：fn 内部只允许走 nasProxy（业务接口），**绝不能**间接调用 login，
+// 否则会与 relogin 形成无限递归。
+func (d *ZhiJiaDisk) withRelogin(ctx context.Context, fn func() error) error {
+	err := fn()
+	if err == nil || !isAuthFailure(err) {
+		return err
+	}
+	utils.Log.Warnf("[zhi] auth failed, restoring session: %v", err)
+	if rerr := d.relogin(ctx); rerr != nil {
+		// 恢复失败时返回原始错误，更有诊断价值
+		utils.Log.Errorf("[zhi] restore session failed: %v", rerr)
+		return err
+	}
+	return fn()
+}
+
+// refreshSession 凭已存的会话 cookie 重新拉取用户信息。
+// token 失效（1009）时上游就是这么恢复的：不带密码，只靠 cookie。
+// 成功即说明会话仍然有效，调用方可以据此重试原请求。
+func (d *ZhiJiaDisk) refreshSession(ctx context.Context) error {
+	if err := d.refreshUserInfo(ctx); err != nil {
+		return err
+	}
+	op.MustSaveDriverStorage(d)
+	return nil
+}
+
 // rawPost 发一个带认证头的 JSON POST，返回通用信封（data 未解析）
 func (d *ZhiJiaDisk) rawPost(ctx context.Context, url string, body interface{}, result interface{}) error {
 	res, err := d.client.R().
@@ -257,31 +430,40 @@ func (d *ZhiJiaDisk) volumeInfo(ctx context.Context) (*volumeInfo, error) {
 
 // ==================== 文件操作 ====================
 
-// nasProxy 统一走 POST /nas/rd_center/data/get，body 为 {method, type, data}
+// nasProxy 统一走 POST /nas/rd_center/data/get，body 为 {method, type, data}。
+// 鉴权失效时自动恢复会话并重试一次。
 func (d *ZhiJiaDisk) nasProxy(ctx context.Context, method string, data base.Json, typ ...int) (json.RawMessage, error) {
 	t := 1
 	if len(typ) > 0 {
 		t = typ[0]
 	}
-	var inner nasResp
-	if err := d.rawPost(ctx, apiBase+"/nas/rd_center/data/get", base.Json{
-		"method": method,
-		"type":   t,
-		"data":   data,
-	}, &inner); err != nil {
+	var raw json.RawMessage
+	err := d.withRelogin(ctx, func() error {
+		var inner nasResp
+		if err := d.rawPost(ctx, apiBase+"/nas/rd_center/data/get", base.Json{
+			"method": method,
+			"type":   t,
+			"data":   data,
+		}, &inner); err != nil {
+			return err
+		}
+		if inner.Code != 200 {
+			return fmt.Errorf("%s failed: code %d, msg: %s", method, inner.Code, inner.Msg)
+		}
+		if inner.Data.ErrorCode != "0" {
+			msg := inner.Data.ErrorMsg
+			if msg == "" {
+				msg = fmt.Sprintf("errorCode %s", inner.Data.ErrorCode)
+			}
+			return fmt.Errorf("%s failed: %s", method, msg)
+		}
+		raw = inner.Data.Data
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if inner.Code != 200 {
-		return nil, fmt.Errorf("%s failed: code %d, msg: %s", method, inner.Code, inner.Msg)
-	}
-	if inner.Data.ErrorCode != "0" {
-		msg := inner.Data.ErrorMsg
-		if msg == "" {
-			msg = fmt.Sprintf("errorCode %s", inner.Data.ErrorCode)
-		}
-		return nil, fmt.Errorf("%s failed: %s", method, msg)
-	}
-	return inner.Data.Data, nil
+	return raw, nil
 }
 
 // list 列出目录下的文件与目录
@@ -306,7 +488,28 @@ func (d *ZhiJiaDisk) list(ctx context.Context, dir string) ([]fileEntry, error) 
 
 // getToken 换取上传/下载 token。
 // 该接口要求 form-urlencoded，且 pathFileName 不做 URL 编码（与小程序一致）。
+// 鉴权失效时自动恢复会话并重试一次。
 func (d *ZhiJiaDisk) getToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
+	var token string
+	err := d.withRelogin(ctx, func() error {
+		t, err := d.fetchToken(ctx, pathFileName, uploadType)
+		if err != nil {
+			return err
+		}
+		token = t
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	// 换 token 的响应可能刷新 cookie，落库
+	if d.saveCookies() {
+		op.MustSaveDriverStorage(d)
+	}
+	return token, nil
+}
+
+func (d *ZhiJiaDisk) fetchToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
 	var resp apiResp
 	res, err := d.client.R().
 		SetContext(ctx).

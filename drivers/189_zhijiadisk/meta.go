@@ -16,6 +16,12 @@ type Addition struct {
 	// 故意不带 json tag：getAdditionalItems 会跳过无 tag 字段，
 	// 这样它不会出现在添加存储的表单里，但仍会被持久化。
 	ForwardUrl string
+
+	// Cookies 持久化上游下发的会话 cookie（JSON 数组）。
+	// 同上，不带 json tag，不进表单。
+	// 登录态实际靠 cookie 维持（token 失效时可凭 cookie 不带密码重取用户信息），
+	// 只放在内存 jar 里一重启就丢，会导致反复要求用户重新登录。
+	Cookies string
 }
 
 var config = driver.Config{
