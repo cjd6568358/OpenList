@@ -1,0 +1,88 @@
+name: Minimal Build
+
+# 精简版构建：只出需要的 3 个目标，手动触发。
+# 与 build.yml 的区别仅在 matrix —— 步骤、action 版本、参数完全一致，
+# 因此产物与正式 Test Build 的同名 target 等价。
+#
+# 需要的目标直接改下面的列表即可：
+#   windows-amd64     Windows 10+ x86-64（产物 openlist.exe）
+#   linux-amd64-musl  Linux x86-64，静态（产物 openlist）
+#   linux-arm64-musl  Linux arm64，静态（产物 openlist）
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - windows-amd64
+          - linux-amd64-musl
+          - linux-arm64-musl
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # 与 release.yml 一致：浅克隆但要取 tag，
+          # 否则 git describe 拿不到版本号。
+          fetch-depth: 1
+          fetch-tags: true
+
+      - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
+        id: short-sha
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.1"
+
+      - name: Setup web
+        # release -> FetchWebRelease：拉前端最新**稳定** release，
+        # 而非 dev 走的 edge 滚动通道。
+        run: bash build.sh release web
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
+
+      - name: Build
+        uses: OpenListTeam/cgo-actions@6fcace5934c36d70503dba06e2396bb58b766130 # v1.2.5
+        with:
+          targets: ${{ matrix.target }}
+          flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-linkmode external -extldflags ''-static -fpic''' || '-ldflags=' }}
+          static-link-for-musl: true
+          musl-target-format: $os-$musl-$arch
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          out-dir: build
+          x-flags: |
+            github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$built_at
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$git_commit
+            github.com/OpenListTeam/OpenList/v4/internal/conf.Version=$tag
+            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling
+          output: openlist$ext
+
+      - name: Verify musl binary is static
+        if: contains(matrix.target, '-musl')
+        run: |
+          set -e
+          if readelf -l build/openlist | grep -q "Requesting program interpreter"; then
+            echo "Dynamic binary detected: build/openlist"
+            readelf -l build/openlist | grep "Requesting program interpreter" || true
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openlist_${{ steps.short-sha.outputs.sha }}_${{ matrix.target }}
+          # 手动触发的 workflow 会对同一 commit 反复跑，artifact 同名会冲突，
+          # 故覆盖而非报错。
+          overwrite: true
+          path: build/*
