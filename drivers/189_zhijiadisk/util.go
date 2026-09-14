@@ -213,10 +213,7 @@ func (d *ZhiJiaDisk) hasCookies() bool {
 // saveCookies 把 jar 内容序列化进 Addition。
 // 返回是否有变化，避免每次请求都写库。
 func (d *ZhiJiaDisk) saveCookies() bool {
-	if d.client == nil || d.client.GetClient() == nil {
-		return false
-	}
-	jar := d.client.GetClient().CookieJar
+	jar := d.jar
 	if jar == nil {
 		return false
 	}
@@ -254,7 +251,7 @@ func (d *ZhiJiaDisk) restoreCookies() {
 	if len(cookies) == 0 {
 		return
 	}
-	jar := d.client.GetClient().CookieJar
+	jar := d.jar
 	if jar == nil {
 		return
 	}

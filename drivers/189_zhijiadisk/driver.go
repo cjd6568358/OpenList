@@ -35,6 +35,10 @@ type ZhiJiaDisk struct {
 	// 交给 jar 自动维护，避免每次请求都重新协商。
 	client *resty.Client
 
+	// jar 就是 client 用的那个 cookie jar，单独留个引用便于读写与持久化
+	// （http.Client 的字段名是 Jar，直接从 client 上捞比较绕）。
+	jar *cookiejar.Jar
+
 	// authMu 串行化「重新登录 / 刷新会话」，避免并发请求同时触发多轮登录。
 	authMu sync.Mutex
 }
@@ -54,6 +58,7 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	d.jar = jar
 	d.client = base.NewRestyClient().SetCookieJar(jar)
 
 	// 回填上次持久化的会话 cookie，尽量免去重新登录
@@ -109,7 +114,7 @@ func (d *ZhiJiaDisk) regraftCookies() {
 	if err := json.Unmarshal([]byte(d.Addition.Cookies), &cookies); err != nil || len(cookies) == 0 {
 		return
 	}
-	jar := d.client.GetClient().CookieJar
+	jar := d.jar
 	if jar == nil {
 		return
 	}
