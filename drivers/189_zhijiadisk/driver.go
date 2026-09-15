@@ -52,14 +52,32 @@ func (d *ZhiJiaDisk) GetAddition() driver.Additional {
 }
 
 func (d *ZhiJiaDisk) Init(ctx context.Context) error {
-	// 实测无需模拟小程序请求头（带上 servicewechat Referer 或 MicroMessenger UA
-	// 反而会被 WAF 拦截）。保留 cookie jar 以自动接住上游下发的会话 cookie。
+	// 上游挂着瑞数（RiverSecurity）系 WAF，对请求头极其敏感。
+	// 参考 mp_zhijiadisk/web/proxy-server.js 里已趟平的结论：
+	//   - 带 MicroMessenger / 微信小程序 UA 会被直接打回 412
+	//   - 带 servicewechat 的 Referer 同样触发挑战
+	//   - 伪装成浏览器的 UA（base.NewRestyClient 默认那个带 OpenList 指纹的）
+	//     也是挑战目标，所以这里整体清空 UA，只留最小头集合
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return err
 	}
 	d.jar = jar
-	d.client = base.NewRestyClient().SetCookieJar(jar)
+	// base.NewRestyClient() 默认会设一个伪装成浏览器的 UA（含 OpenList 指纹），
+	// 那是 WAF 的重点目标。这里在真正发车前把它清成空串 ——
+	// Go 的 net/http 对「存在但为空」的 User-Agent 会整个省略该头，
+	// 正好对齐 Web 版「不发 UA」的做法。
+	// 用 pre-request hook 而不是 SetHeader，是为了绕开 resty 对空值 header
+	// 的潜在忽略，直接作用到最终的 *http.Request 上。
+	d.client = base.NewRestyClient().
+		SetCookieJar(jar).
+		SetPreRequestHook(func(_ *resty.Client, req *http.Request) error {
+			req.Header.Set("User-Agent", "")
+			req.Header.Del("Referer")
+			req.Header.Del("Origin")
+			req.Header.Del("X-Requested-With")
+			return nil
+		})
 
 	// 回填上次持久化的会话 cookie，尽量免去重新登录
 	d.restoreCookies()
@@ -165,6 +183,10 @@ func (d *ZhiJiaDisk) Link(ctx context.Context, file model.Obj, args model.LinkAr
 	header := make(map[string][]string)
 	for k, v := range d.authHeaders() {
 		header[k] = []string{v}
+	}
+	// 下载由 OpenList 代为发起，同样不认我们的 jar，需把 WAF 挑战 cookie 一并返回
+	if ck := d.cookieHeader(url); ck != "" {
+		header["Cookie"] = []string{ck}
 	}
 	return &model.Link{URL: url, Header: header}, nil
 }

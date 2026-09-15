@@ -172,16 +172,43 @@ func parseTime(s string) time.Time {
 // ==================== 认证相关 ====================
 
 // authHeaders 返回所有请求都要带的头。
-// 注意不要加 Referer / MicroMessenger UA —— 会被上游 WAF 拦截。
+// 只保留上游必需的 X-NAS-* 与一个语言标记；其余一律从简 ——
+// 上游 WAF 对多余/伪装的头部很敏感，见 Init 里的说明。
 func (d *ZhiJiaDisk) authHeaders() map[string]string {
 	return map[string]string{
 		"X-NAS-CLIENTTYPE": "60",
 		"X-NAS-SDKTOKEN":   d.AccessToken,
+		"Accept-Language":  "zh-cn",
 	}
 }
 
 func (d *ZhiJiaDisk) forwardUrl() string {
 	return strings.TrimSuffix(d.Addition.ForwardUrl, "/")
+}
+
+// cookieHeader 从 jar 里取出适用于 target 的 cookie，拼成 Cookie 头。
+//
+// 为什么需要它：WAF 首次 200 会种一颗挑战 cookie，之后**每个**请求都得带上，
+// 否则会被重新挑战（对照 web/proxy-server.js:62 的 wafCookies 逻辑）。
+// resty 那条路径由 SetCookieJar 自动处理，但上传走的是 base.HttpClient、
+// 下载是 OpenList 拿 URL 自己去请求，两者都不认识我们的 jar，必须手动补。
+func (d *ZhiJiaDisk) cookieHeader(target string) string {
+	if d.jar == nil || target == "" {
+		return ""
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return ""
+	}
+	cookies := d.jar.Cookies(u)
+	if len(cookies) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // ==================== 会话 cookie 持久化 ====================
@@ -328,6 +355,11 @@ func (d *ZhiJiaDisk) rawPost(ctx context.Context, url string, body interface{}, 
 		return err
 	}
 	if res.StatusCode() != 200 {
+		// 412 是瑞数 WAF 的挑战响应（响应体是一段动态混淆 JS，不是业务 JSON）。
+		// 单列出来，免得再被当成「接口返回异常」排查。
+		if res.StatusCode() == http.StatusPreconditionFailed {
+			return fmt.Errorf("request %s failed: 被上游 WAF 拦截 (HTTP 412)", url)
+		}
 		return fmt.Errorf("request %s failed: HTTP %d, body: %s", url, res.StatusCode(), res.String())
 	}
 	return nil

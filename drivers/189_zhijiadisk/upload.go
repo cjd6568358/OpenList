@@ -14,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/errgroup"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -119,6 +120,13 @@ func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.Fi
 						req.Header.Set(k, v)
 					}
 					req.Header.Set("Content-Type", "application/octet-stream")
+					// base.HttpClient 不设 UA，Go 默认会补 Go-http-client/1.1。
+					// 上游 WAF 对头部敏感（见 Init 注释），显式清空对齐 Web 版。
+					req.Header.Set("User-Agent", "")
+					// base.HttpClient 也不认我们的 cookie jar，手动补上 WAF 挑战 cookie
+					if ck := d.cookieHeader(reqUrl); ck != "" {
+						req.Header.Set("Cookie", ck)
+					}
 					req.ContentLength = length
 					// 走限速 reader；ContentLength 已显式设置，
 					// 否则 Go 无法为这种非 bytes/strings reader 推断长度
@@ -129,8 +137,16 @@ func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.Fi
 						return err
 					}
 					defer res.Body.Close()
+					// 把响应里的 set-cookie 收进 jar：WAF 首次挑战成功后会在这里种
+					// 挑战 cookie，后续的 resty 请求就能自动带上（对照 proxy-server.js:79）
+					if u, perr := url.Parse(reqUrl); perr == nil && len(res.Cookies()) > 0 {
+						d.jar.SetCookies(u, res.Cookies())
+					}
 					respBody, _ := io.ReadAll(res.Body)
 					if res.StatusCode != 200 {
+						if res.StatusCode == http.StatusPreconditionFailed {
+							return fmt.Errorf("chunk %d: 被上游 WAF 拦截 (HTTP 412)，请检查请求头配置", index)
+						}
 						return fmt.Errorf("chunk %d upload failed: HTTP %d, body: %s",
 							index, res.StatusCode, string(respBody))
 					}
@@ -150,6 +166,11 @@ func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.Fi
 	}
 	if utils.IsCanceled(ctx) {
 		return ctx.Err()
+	}
+
+	// 上传过程中收到的 set-cookie（含 WAF 挑战 cookie）落库，重启后仍可复用
+	if d.saveCookies() {
+		op.MustSaveDriverStorage(d)
 	}
 
 	return d.finalizeUpload(ctx, dir, name)
