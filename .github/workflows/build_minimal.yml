@@ -31,6 +31,12 @@ name: Minimal Build
 # 不需要的目标/变体，直接把 include 里对应那两行注释掉即可。
 
 on:
+  # 推送到 feat/zhijiadisk 分支就自动触发。
+  # 想改分支只改这一行；想再支持别的分支就加成列表：
+  #   branches: [feat/zhijiadisk, other-branch]
+  push:
+    branches: [feat/zhijiadisk]
+  # 保留手动触发，方便不改代码就重跑一次。
   workflow_dispatch:
 
 concurrency:
