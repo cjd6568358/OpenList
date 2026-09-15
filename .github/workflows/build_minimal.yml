@@ -244,15 +244,19 @@ jobs:
           fi
           upx --version
 
-          # 再自检 upx 是否认识这个产物（平台/格式）。这一步失败同样报错，
-          # 理由同上：宁可见红，不要产出伪装成压缩版的原件。
-          upx -t build/openlist
-
           before=$(stat -c %s build/openlist)
           # upx -9 是最高压缩级别，代价是压缩耗时长；对 CI 来说可接受。
+          # 不做"预先探测能否压缩"的自检：upx 没有这种开关 ——
+          # `upx -t` 是校验**已压缩**文件能否正确解压，对未压缩的二进制
+          # 必然报 NotPackedException。能否处理这个格式，直接由下面这条
+          # 命令的退出码回答（不支持的格式会报错退出，set -e 会中断）。
           upx -9 build/openlist
           after=$(stat -c %s build/openlist)
           echo "::notice::upx: $before -> $after bytes"
+
+          # 压缩后再用 -t 校验产物：这才是 -t 的正确用法。
+          upx -t build/openlist
+          echo "::notice::upx: 压缩产物自检通过"
 
       - name: Report linkage and size
         # 链接方式靠推断，不能靠假设 —— 每次把实际结果打出来，
