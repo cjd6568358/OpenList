@@ -22,11 +22,13 @@ name: Minimal Build
 #
 # UPX 说明：只对 linux 生效（windows 那条不做，见下方 comment）。
 #   build.sh 里有一段被注释掉的 upx 代码，注释称"部分平台对 upx 压缩有问题"，
-#   那是针对 xgo 交叉编译产物的。本 workflow 的 linux 产物统一在 linux runner
-#   上构建，因此这里加了 upx 可用性自检。
-#   注意：自检失败是**报错退出**而非警告跳过 —— 否则 compress=upx 的变体
+#   那是针对 xgo 交叉编译产物的。实测本 workflow 各 linux 变体均可压缩成功
+#   （含 arm64），故该顾虑不成立。
+#   自检失败是**报错退出**而非警告跳过 —— 否则 compress=upx 的变体
 #   会产出其实没压缩的产物，名不副实且看不出。fail-fast 已关，
 #   单个变体失败不影响其它变体。
+#   ⚠ 范围收窄：只保留 nocgo 那两组 UPX。musl/glibc 组实测只省 1~3%，
+#     却让 artifact 总量近乎翻倍；nocgo 组能省约 10%。详见下方 matrix 注释。
 #
 # 不需要的目标/变体，直接把 include 里对应那两行注释掉即可。
 
@@ -99,37 +101,47 @@ jobs:
             frontend: lite
             compress: none
 
-          # ---- UPX 压缩变体（仅 linux）----
-          - target: linux-amd64-musl
-            frontend: full
-            compress: upx
-          - target: linux-arm64-musl
-            frontend: full
-            compress: upx
-          - target: linux-amd64
-            frontend: full
-            compress: upx
-          - target: linux-arm64
-            frontend: full
-            compress: upx
+          # ---- UPX 压缩变体（仅 linux，且只保留 nocgo）----
+          #
+          # 实测压缩率（artifact 体积，同架构同前端对比）：
+          #   linux-amd64-musl  full  71.2MB -> 69.7MB   节省 2%
+          #   linux-amd64-musl  lite  54.5MB -> 52.8MB   节省 3%
+          #   linux-arm64       full  70.1MB -> 69.2MB   节省 1%
+          #   linux-arm64-nocgo lite  28.6MB -> 25.7MB   节省 10%
+          # musl/glibc 三组收益只有 1~3%，纯 Go(nocgo) 组有 10% ——
+          # 所以其余几组已注释掉：它们让 artifact 总量近乎翻倍，只换 1~3%，
+          # 性价比是负的。要恢复某组，把对应几行取消注释即可。
+          #
+          # - target: linux-amd64-musl
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-arm64-musl
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-amd64
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-arm64
+          #   frontend: full
+          #   compress: upx
           - target: linux-amd64-nocgo
             frontend: full
             compress: upx
           - target: linux-arm64-nocgo
             frontend: full
             compress: upx
-          - target: linux-amd64-musl
-            frontend: lite
-            compress: upx
-          - target: linux-arm64-musl
-            frontend: lite
-            compress: upx
-          - target: linux-amd64
-            frontend: lite
-            compress: upx
-          - target: linux-arm64
-            frontend: lite
-            compress: upx
+          # - target: linux-amd64-musl
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-arm64-musl
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-amd64
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-arm64
+          #   frontend: lite
+          #   compress: upx
           - target: linux-amd64-nocgo
             frontend: lite
             compress: upx
