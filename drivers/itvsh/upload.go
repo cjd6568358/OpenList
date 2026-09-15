@@ -1,4 +1,4 @@
-package zhijiadisk
+package itvsh
 
 import (
 	"bytes"
@@ -28,7 +28,7 @@ import (
 //  2. 分块并发 POST 到 {forwardUrl}/nasforward/file/binary/upload，
 //     每块的 fileName 参数是「原名 + .crash」，offset 为该块起始位置
 //  3. 全部传完后收尾：exist 检查同名 -> 有则先删 -> 把 .crash 改名回真名
-func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
 	dir := normalizePath(dstDir.GetPath())
 	name := file.GetName()
 	fullPath := joinPath(dir, name)
@@ -178,7 +178,7 @@ func (d *ZhiJiaDisk) upload(ctx context.Context, dstDir model.Obj, file model.Fi
 
 // finalizeUpload 收尾：把「文件名.crash」变成正式文件。
 // 若已存在同名文件，需先删除，否则重命名会失败。
-func (d *ZhiJiaDisk) finalizeUpload(ctx context.Context, dir, name string) error {
+func (d *Itvsh) finalizeUpload(ctx context.Context, dir, name string) error {
 	exists, err := d.fileExist(ctx, dir, name)
 	if err != nil {
 		return err

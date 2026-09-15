@@ -1,4 +1,4 @@
-package zhijiadisk
+package itvsh
 
 import (
 	"context"
@@ -28,7 +28,7 @@ const (
 	chunkSize = 512 * 1024
 )
 
-type ZhiJiaDisk struct {
+type Itvsh struct {
 	model.Storage
 	Addition
 
@@ -44,15 +44,15 @@ type ZhiJiaDisk struct {
 	authMu sync.Mutex
 }
 
-func (d *ZhiJiaDisk) Config() driver.Config {
+func (d *Itvsh) Config() driver.Config {
 	return config
 }
 
-func (d *ZhiJiaDisk) GetAddition() driver.Additional {
+func (d *Itvsh) GetAddition() driver.Additional {
 	return &d.Addition
 }
 
-func (d *ZhiJiaDisk) Init(ctx context.Context) error {
+func (d *Itvsh) Init(ctx context.Context) error {
 	// 上游挂着瑞数（RiverSecurity）系 WAF，对请求头极其敏感。
 	// 参考 mp_zhijiadisk/web/proxy-server.js 里已趟平的结论：
 	//   - 带 MicroMessenger / 微信小程序 UA 会被直接打回 412
@@ -128,7 +128,7 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 // regraftCookies 在 forwardUrl 就绪后，把已持久化的 cookie 重新回填到
 // 正确的作用域上。Init 早期 forwardUrl 为空，jar 里只认 apiBase，
 // 这里补上 forwardUrl 对应的 host。
-func (d *ZhiJiaDisk) regraftCookies() {
+func (d *Itvsh) regraftCookies() {
 	if d.Addition.Cookies == "" || d.forwardUrl() == "" {
 		return
 	}
@@ -145,7 +145,7 @@ func (d *ZhiJiaDisk) regraftCookies() {
 	}
 }
 
-func (d *ZhiJiaDisk) Drop(ctx context.Context) error {
+func (d *Itvsh) Drop(ctx context.Context) error {
 	d.authMu.Lock()
 	// 停用/重载时尽量把会话 cookie 存下来
 	if d.saveCookies() {
@@ -155,7 +155,7 @@ func (d *ZhiJiaDisk) Drop(ctx context.Context) error {
 	return nil
 }
 
-func (d *ZhiJiaDisk) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+func (d *Itvsh) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	entries, err := d.list(ctx, dir.GetPath())
 	if err != nil {
 		return nil, err
@@ -173,7 +173,7 @@ func (d *ZhiJiaDisk) List(ctx context.Context, dir model.Obj, args model.ListArg
 
 // Link 取下载直链。除 URL 外还必须带上 X-NAS-SDKTOKEN 头，
 // 因此把 header 一并返回，由 OpenList 代理下载时携带。
-func (d *ZhiJiaDisk) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+func (d *Itvsh) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	token, err := d.getToken(ctx, file.GetPath(), uploadTypeDownload)
 	if err != nil {
 		return nil, err
@@ -196,7 +196,7 @@ func (d *ZhiJiaDisk) Link(ctx context.Context, file model.Obj, args model.LinkAr
 }
 
 // MakeDir 新建目录。注意接口收的是**完整路径**，不是「父目录+名字」。
-func (d *ZhiJiaDisk) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+func (d *Itvsh) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
 	_, err := d.nasProxy(ctx, methodCreateDir, base.Json{
 		"directory": normalizePath(joinPath(parentDir.GetPath(), dirName)),
 	})
@@ -204,7 +204,7 @@ func (d *ZhiJiaDisk) MakeDir(ctx context.Context, parentDir model.Obj, dirName s
 }
 
 // Rename 重命名。文件与目录都用 file.rename（与小程序一致）。
-func (d *ZhiJiaDisk) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
+func (d *Itvsh) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
 	_, err := d.nasProxy(ctx, methodFileRename, base.Json{
 		"directory":   normalizePath(parentPath(srcObj.GetPath())),
 		"filename":    srcObj.GetName(),
@@ -215,7 +215,7 @@ func (d *ZhiJiaDisk) Rename(ctx context.Context, srcObj model.Obj, newName strin
 
 // Move 移动。服务端没有独立 move 接口，移动即「按路径改路径」：
 // 把 directory 改成含文件名的完整新路径 newDirectory。
-func (d *ZhiJiaDisk) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+func (d *Itvsh) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 	src := normalizePath(srcObj.GetPath())
 	// 注意目标路径用源节点的 Name 拼接，需归一化以免拼出「家庭共享」
 	target := normalizePath(joinPath(dstDir.GetPath(), srcObj.GetName()))
@@ -230,11 +230,11 @@ func (d *ZhiJiaDisk) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 }
 
 // Copy 服务端未提供任何复制接口（已遍历全部 method 确认），无法实现。
-func (d *ZhiJiaDisk) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
+func (d *Itvsh) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 	return errs.NotSupport
 }
 
-func (d *ZhiJiaDisk) Remove(ctx context.Context, obj model.Obj) error {
+func (d *Itvsh) Remove(ctx context.Context, obj model.Obj) error {
 	if obj.IsDir() {
 		_, err := d.nasProxy(ctx, methodDeleteDir, base.Json{
 			"directory": normalizePath(obj.GetPath()),
@@ -248,11 +248,11 @@ func (d *ZhiJiaDisk) Remove(ctx context.Context, obj model.Obj) error {
 	return err
 }
 
-func (d *ZhiJiaDisk) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *Itvsh) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	return d.upload(ctx, dstDir, stream, up)
 }
 
-func (d *ZhiJiaDisk) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
+func (d *Itvsh) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
 	info, err := d.volumeInfo(ctx)
 	if err != nil {
 		return nil, err
@@ -272,4 +272,4 @@ func (d *ZhiJiaDisk) GetDetails(ctx context.Context) (*model.StorageDetails, err
 		},
 	}, nil
 }
-var _ driver.Driver = (*ZhiJiaDisk)(nil)
+var _ driver.Driver = (*Itvsh)(nil)

@@ -1,4 +1,4 @@
-package zhijiadisk
+package itvsh
 
 import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -41,6 +41,6 @@ var config = driver.Config{
 
 func init() {
 	op.RegisterDriver(func() driver.Driver {
-		return &ZhiJiaDisk{}
+		return &Itvsh{}
 	})
 }

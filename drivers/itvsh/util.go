@@ -1,4 +1,4 @@
-package zhijiadisk
+package itvsh
 
 import (
 	"context"
@@ -174,7 +174,7 @@ func parseTime(s string) time.Time {
 // authHeaders 返回所有请求都要带的头。
 // 只保留上游必需的 X-NAS-* 与一个语言标记；其余一律从简 ——
 // 上游 WAF 对多余/伪装的头部很敏感，见 Init 里的说明。
-func (d *ZhiJiaDisk) authHeaders() map[string]string {
+func (d *Itvsh) authHeaders() map[string]string {
 	return map[string]string{
 		"X-NAS-CLIENTTYPE": "60",
 		"X-NAS-SDKTOKEN":   d.AccessToken,
@@ -182,7 +182,7 @@ func (d *ZhiJiaDisk) authHeaders() map[string]string {
 	}
 }
 
-func (d *ZhiJiaDisk) forwardUrl() string {
+func (d *Itvsh) forwardUrl() string {
 	return strings.TrimSuffix(d.Addition.ForwardUrl, "/")
 }
 
@@ -192,7 +192,7 @@ func (d *ZhiJiaDisk) forwardUrl() string {
 // 否则会被重新挑战（对照 web/proxy-server.js:62 的 wafCookies 逻辑）。
 // resty 那条路径由 SetCookieJar 自动处理，但上传走的是 base.HttpClient、
 // 下载是 OpenList 拿 URL 自己去请求，两者都不认识我们的 jar，必须手动补。
-func (d *ZhiJiaDisk) cookieHeader(target string) string {
+func (d *Itvsh) cookieHeader(target string) string {
 	if d.jar == nil || target == "" {
 		return ""
 	}
@@ -219,7 +219,7 @@ func (d *ZhiJiaDisk) cookieHeader(target string) string {
 
 // persistURLs 是 jar 的“作用域种子”。jar 以 host 为键收集 cookie，
 // 恢复时得先知道该往哪些 host 回填 —— 这两个正是本驱动会访问的域名。
-func (d *ZhiJiaDisk) persistURLs() []*url.URL {
+func (d *Itvsh) persistURLs() []*url.URL {
 	urls := make([]*url.URL, 0, 2)
 	for _, raw := range []string{apiBase, d.forwardUrl()} {
 		if raw == "" {
@@ -233,13 +233,13 @@ func (d *ZhiJiaDisk) persistURLs() []*url.URL {
 }
 
 // hasCookies 是否已有可复用的会话 cookie
-func (d *ZhiJiaDisk) hasCookies() bool {
+func (d *Itvsh) hasCookies() bool {
 	return d.Addition.Cookies != "" && len(d.persistURLs()) > 0
 }
 
 // saveCookies 把 jar 内容序列化进 Addition。
 // 返回是否有变化，避免每次请求都写库。
-func (d *ZhiJiaDisk) saveCookies() bool {
+func (d *Itvsh) saveCookies() bool {
 	jar := d.jar
 	if jar == nil {
 		return false
@@ -265,7 +265,7 @@ func (d *ZhiJiaDisk) saveCookies() bool {
 
 // restoreCookies 在 Init 时把上次存的 cookie 回填进 jar。
 // 内容损坏时静默跳过并清空，退化为重新登录，不影响可用性。
-func (d *ZhiJiaDisk) restoreCookies() {
+func (d *Itvsh) restoreCookies() {
 	if d.Addition.Cookies == "" {
 		return
 	}
@@ -290,7 +290,7 @@ func (d *ZhiJiaDisk) restoreCookies() {
 // relogin 在业务请求因鉴权失效失败时恢复会话，全程无用户介入。
 // 顺序与上游一致：先用会话 cookie 重取用户信息（不带密码），
 // 不行再用已存密码重新登录。
-func (d *ZhiJiaDisk) relogin(ctx context.Context) error {
+func (d *Itvsh) relogin(ctx context.Context) error {
 	d.authMu.Lock()
 	defer d.authMu.Unlock()
 
@@ -318,7 +318,7 @@ func (d *ZhiJiaDisk) relogin(ctx context.Context) error {
 //
 // 注意：fn 内部只允许走 nasProxy（业务接口），**绝不能**间接调用 login，
 // 否则会与 relogin 形成无限递归。
-func (d *ZhiJiaDisk) withRelogin(ctx context.Context, fn func() error) error {
+func (d *Itvsh) withRelogin(ctx context.Context, fn func() error) error {
 	err := fn()
 	if err == nil || !isAuthFailure(err) {
 		return err
@@ -335,7 +335,7 @@ func (d *ZhiJiaDisk) withRelogin(ctx context.Context, fn func() error) error {
 // refreshSession 凭已存的会话 cookie 重新拉取用户信息。
 // token 失效（1009）时上游就是这么恢复的：不带密码，只靠 cookie。
 // 成功即说明会话仍然有效，调用方可以据此重试原请求。
-func (d *ZhiJiaDisk) refreshSession(ctx context.Context) error {
+func (d *Itvsh) refreshSession(ctx context.Context) error {
 	if err := d.refreshUserInfo(ctx); err != nil {
 		return err
 	}
@@ -344,7 +344,7 @@ func (d *ZhiJiaDisk) refreshSession(ctx context.Context) error {
 }
 
 // rawPost 发一个带认证头的 JSON POST，返回通用信封（data 未解析）
-func (d *ZhiJiaDisk) rawPost(ctx context.Context, url string, body interface{}, result interface{}) error {
+func (d *Itvsh) rawPost(ctx context.Context, url string, body interface{}, result interface{}) error {
 	res, err := d.client.R().
 		SetContext(ctx).
 		SetHeaders(d.authHeaders()).
@@ -366,7 +366,7 @@ func (d *ZhiJiaDisk) rawPost(ctx context.Context, url string, body interface{}, 
 }
 
 // postEnvelope 发 JSON POST 并校验外层 code
-func (d *ZhiJiaDisk) postEnvelope(ctx context.Context, url string, body interface{}) (*apiResp, error) {
+func (d *Itvsh) postEnvelope(ctx context.Context, url string, body interface{}) (*apiResp, error) {
 	var resp apiResp
 	if err := d.rawPost(ctx, url, body, &resp); err != nil {
 		return nil, err
@@ -379,7 +379,7 @@ func (d *ZhiJiaDisk) postEnvelope(ctx context.Context, url string, body interfac
 
 // login 用手机号+密码登录。
 // 流程：取 AES 密钥 -> 加密密码 -> 提交登录。
-func (d *ZhiJiaDisk) login(ctx context.Context) error {
+func (d *Itvsh) login(ctx context.Context) error {
 	// 1. 取密钥
 	keyResp, err := d.postEnvelope(ctx, apiBase+"/nas/session/key", base.Json{
 		"mobile": d.Mobile,
@@ -426,7 +426,7 @@ func (d *ZhiJiaDisk) login(ctx context.Context) error {
 
 // refreshUserInfo 拉取用户信息以补全 forwardUrl。
 // forwardUrl 是上传/下载用的另一个域名，登录响应里不一定带。
-func (d *ZhiJiaDisk) refreshUserInfo(ctx context.Context) error {
+func (d *Itvsh) refreshUserInfo(ctx context.Context) error {
 	infoResp, err := d.postEnvelope(ctx, apiBase+"/nas/user/info", base.Json{})
 	if err != nil {
 		return err
@@ -445,7 +445,7 @@ func (d *ZhiJiaDisk) refreshUserInfo(ctx context.Context) error {
 }
 
 // volumeInfo 取空间信息
-func (d *ZhiJiaDisk) volumeInfo(ctx context.Context) (*volumeInfo, error) {
+func (d *Itvsh) volumeInfo(ctx context.Context) (*volumeInfo, error) {
 	resp, err := d.postEnvelope(ctx, apiBase+"/nas/volume/info", base.Json{})
 	if err != nil {
 		return nil, err
@@ -461,7 +461,7 @@ func (d *ZhiJiaDisk) volumeInfo(ctx context.Context) (*volumeInfo, error) {
 
 // nasProxy 统一走 POST /nas/rd_center/data/get，body 为 {method, type, data}。
 // 鉴权失效时自动恢复会话并重试一次。
-func (d *ZhiJiaDisk) nasProxy(ctx context.Context, method string, data base.Json, typ ...int) (json.RawMessage, error) {
+func (d *Itvsh) nasProxy(ctx context.Context, method string, data base.Json, typ ...int) (json.RawMessage, error) {
 	t := 1
 	if len(typ) > 0 {
 		t = typ[0]
@@ -496,7 +496,7 @@ func (d *ZhiJiaDisk) nasProxy(ctx context.Context, method string, data base.Json
 }
 
 // list 列出目录下的文件与目录
-func (d *ZhiJiaDisk) list(ctx context.Context, dir string) ([]fileEntry, error) {
+func (d *Itvsh) list(ctx context.Context, dir string) ([]fileEntry, error) {
 	if dir == "" {
 		dir = "/"
 	}
@@ -518,7 +518,7 @@ func (d *ZhiJiaDisk) list(ctx context.Context, dir string) ([]fileEntry, error) 
 // getToken 换取上传/下载 token。
 // 该接口要求 form-urlencoded，且 pathFileName 不做 URL 编码（与小程序一致）。
 // 鉴权失效时自动恢复会话并重试一次。
-func (d *ZhiJiaDisk) getToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
+func (d *Itvsh) getToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
 	var token string
 	err := d.withRelogin(ctx, func() error {
 		t, err := d.fetchToken(ctx, pathFileName, uploadType)
@@ -538,7 +538,7 @@ func (d *ZhiJiaDisk) getToken(ctx context.Context, pathFileName string, uploadTy
 	return token, nil
 }
 
-func (d *ZhiJiaDisk) fetchToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
+func (d *Itvsh) fetchToken(ctx context.Context, pathFileName string, uploadType int) (string, error) {
 	var resp apiResp
 	res, err := d.client.R().
 		SetContext(ctx).
@@ -574,7 +574,7 @@ func (d *ZhiJiaDisk) fetchToken(ctx context.Context, pathFileName string, upload
 }
 
 // fileExist 检查目录下是否已存在同名文件
-func (d *ZhiJiaDisk) fileExist(ctx context.Context, dir, name string) (bool, error) {
+func (d *Itvsh) fileExist(ctx context.Context, dir, name string) (bool, error) {
 	raw, err := d.nasProxy(ctx, methodFileExist, base.Json{
 		"directory": dir,
 		"filename":  name,
