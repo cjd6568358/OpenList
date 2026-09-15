@@ -3,6 +3,7 @@ package zhijiadisk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -82,8 +83,10 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 	// 回填上次持久化的会话 cookie，尽量免去重新登录
 	d.restoreCookies()
 
+	// 兜底 5，与表单默认值、以及官方客户端的 maxConcurrency 保持一致。
+	// 表单的 default 只在新建时生效，老配置里 upload_thread 可能是 0。
 	if d.UploadThread <= 0 {
-		d.UploadThread = 3
+		d.UploadThread = 5
 	} else if d.UploadThread > 8 {
 		d.UploadThread = 8
 	}
@@ -92,12 +95,13 @@ func (d *ZhiJiaDisk) Init(ctx context.Context) error {
 	// 注意 persistURLs 依赖 forwardUrl，此时它通常还是空的（首次配置时
 	// 靠下面 refreshUserInfo 才拿到），所以恢复的 cookie 会先全部落在
 	// apiBase 上；refreshUserInfo 之后会按真实 forwardUrl 再存一次。
+	// 无 token 时只能走账密登录（表单层已允许两者都留空，故这里必须显式拦下，
+	// 否则会拿空账号去请求，报出难以理解的业务错误）。
+	// 这里不用 errs.EmptyUsername/EmptyPassword：那是通用文案（"username is empty"），
+	// 在「二选一」语义下说不清到底该补哪一边。
 	if d.AccessToken == "" {
-		if d.Mobile == "" {
-			return errs.EmptyUsername
-		}
-		if d.Password == "" {
-			return errs.EmptyPassword
+		if d.Mobile == "" || d.Password == "" {
+			return errors.New("请填写手机号+密码，或填写 Access token（二选一）")
 		}
 		if err := d.login(ctx); err != nil {
 			// 有持久化的会话 cookie 时，即使密码登录失败也能凭 cookie 继续
