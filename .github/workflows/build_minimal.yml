@@ -238,8 +238,10 @@ jobs:
 
           # 与 cgo-actions 的 x-flags 保持一致，只是这里要自己拼。
           # Version 取 GITHUB_REF_NAME（runner 自带的环境变量，本 workflow
-          # 由分支触发，即分支名），不走 ${{ }} 展开：脚本内容固定，
+          # 由分支触发，即分支名），不走 Actions 表达式展开：脚本内容固定，
           # 不受 ref 名里可能出现的 shell 元字符影响。
+          # （注意：本注释里不能写那种表达式字面量 —— 哪怕在 shell 注释里，
+          #   Actions 也会先解析，空表达式会让整个 workflow 校验失败。）
           # ⚠ cgo 那侧走的是 cgo-actions 的 $tag，两者不一定相等 ——
           #   想让同名变体自报一致，需要核对 cgo-actions 里 $tag 的实际取值。
           LDFLAGS="-w -s \
