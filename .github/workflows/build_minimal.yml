@@ -89,74 +89,74 @@ jobs:
         include:
           # ---- Windows 10+ x86-64（产物 openlist.exe）----
           - target: windows-amd64
-            frontend: full
+            frontend: lite
             compress: none
 
           # ---- Linux，musl 全静态（原有）----
-          - target: linux-amd64-musl
-            frontend: full
-            compress: none
-          - target: linux-arm64-musl
-            frontend: full
-            compress: none
+          # - target: linux-amd64-musl
+          #   frontend: full
+          #   compress: none
+          # - target: linux-arm64-musl
+          #   frontend: full
+          #   compress: none
 
           # ---- Linux，glibc 动态链接（新增）----
-          - target: linux-amd64
-            frontend: full
-            compress: none
-          - target: linux-arm64
-            frontend: full
-            compress: none
+          # - target: linux-amd64
+          #   frontend: full
+          #   compress: none
+          # - target: linux-arm64
+          #   frontend: full
+          #   compress: none
 
           # ---- Linux，纯 Go 零依赖 CGO_ENABLED=0（新增）----
-          - target: linux-amd64-nocgo
-            frontend: full
-            compress: none
-          - target: linux-arm64-nocgo
-            frontend: full
-            compress: none
+          # - target: linux-amd64-nocgo
+          #   frontend: full
+          #   compress: none
+          # - target: linux-arm64-nocgo
+          #   frontend: full
+          #   compress: none
 
           # ---- lite 前端变体（体积大头在这里）----
-          - target: linux-amd64-musl
-            frontend: lite
-            compress: none
-          - target: linux-arm64-musl
-            frontend: lite
-            compress: none
-          - target: linux-amd64
-            frontend: lite
-            compress: none
-          - target: linux-arm64
-            frontend: lite
-            compress: none
-          - target: linux-amd64-nocgo
-            frontend: lite
-            compress: none
-          - target: linux-arm64-nocgo
-            frontend: lite
-            compress: none
+          # - target: linux-amd64-musl
+          #   frontend: lite
+          #   compress: none
+          # - target: linux-arm64-musl
+          #   frontend: lite
+          #   compress: none
+          # - target: linux-amd64
+          #   frontend: lite
+          #   compress: none
+          # - target: linux-arm64
+          #   frontend: lite
+          #   compress: none
+          # - target: linux-amd64-nocgo
+          #   frontend: lite
+          #   compress: none
+          # - target: linux-arm64-nocgo
+          #   frontend: lite
+          #   compress: none
 
           # ---- UPX 压缩变体（仅 linux；三种链接方式 × 两种前端 = 12 条）----
           # 想让变体数减半、只保留收益较大的 nocgo 那几条，
           # 把 musl / glibc 对应的行注释掉即可（详见文件头的 UPX 说明）。
-          - target: linux-amd64-musl
-            frontend: full
-            compress: upx
-          - target: linux-arm64-musl
-            frontend: full
-            compress: upx
-          - target: linux-amd64
-            frontend: full
-            compress: upx
-          - target: linux-arm64
-            frontend: full
-            compress: upx
-          - target: linux-amd64-nocgo
-            frontend: full
-            compress: upx
-          - target: linux-arm64-nocgo
-            frontend: full
-            compress: upx
+          # - target: linux-amd64-musl
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-arm64-musl
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-amd64
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-arm64
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-amd64-nocgo
+          #   frontend: full
+          #   compress: upx
+          # - target: linux-arm64-nocgo
+          #   frontend: full
+          #   compress: upx
           - target: linux-amd64-musl
             frontend: lite
             compress: upx
