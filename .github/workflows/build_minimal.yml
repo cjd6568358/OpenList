@@ -157,18 +157,18 @@ jobs:
           # - target: linux-arm64-nocgo
           #   frontend: full
           #   compress: upx
-          - target: linux-amd64-musl
-            frontend: lite
-            compress: upx
-          - target: linux-arm64-musl
-            frontend: lite
-            compress: upx
-          - target: linux-amd64
-            frontend: lite
-            compress: upx
-          - target: linux-arm64
-            frontend: lite
-            compress: upx
+          # - target: linux-amd64-musl
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-arm64-musl
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-amd64
+          #   frontend: lite
+          #   compress: upx
+          # - target: linux-arm64
+          #   frontend: lite
+          #   compress: upx
           - target: linux-amd64-nocgo
             frontend: lite
             compress: upx
