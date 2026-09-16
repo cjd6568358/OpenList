@@ -14,6 +14,10 @@
 #
 # 未配置 WEBDAV_URL 时打印 notice 并成功退出 —— 这样 fork 出来、
 # 或没配 secret 的人跑同一个 workflow 也不会因为上传/删除而失败。
+#
+# 失败处理：上传 .txt 遇到 5xx（WebDAV 瞬时错误）时打 warning 并跳过该
+#   文件、继续传后面的，不让 job 变红；7z 或其它 4xx 仍然硬失败。
+#   详见下面 upload 分支里的注释。
 
 set -euo pipefail
 
@@ -86,6 +90,7 @@ dest="$base"
 [ -n "$remote_dir" ] && dest="$base/$remote_dir"
 
 done_count=0
+skipped_count=0
 for f in "$@"; do
   case "$mode" in
     upload)
@@ -97,6 +102,24 @@ for f in "$@"; do
       code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -T "$f" "$dest/$name" || true)
       case "$code" in
         200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
+        5*)
+          # 服务端瞬时错误（502/503/504…）。并发 25 个 matrix job 打同一台
+          # WebDAV 时这类抖动是常态。
+          #
+          # 只对 .txt 容忍，且**必须用 continue 而不是 break/exit**：
+          # 调用方是 upload-webdav.sh <txt> <7z>，txt 排在前面，
+          # 这里一 exit 就会把后面的 7z 一起丢掉。
+          # txt 本身是「尽早可用」的过渡产物，内容又指向 Release
+          # （不经过 WebDAV），传不上去不影响任何人拿到下载地址。
+          # 7z 是镜像主体，传不上去仍然报错 —— 不把它一起吞掉。
+          if [ "${name##*.}" = "txt" ]; then
+            echo "::warning::上传失败 $f -> $dest/$name (HTTP $code)，跳过继续"
+            skipped_count=$((skipped_count + 1))
+            continue
+          fi
+          echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"
+          exit 1
+          ;;
         *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
       esac
       ;;
@@ -117,6 +140,12 @@ for f in "$@"; do
 done
 
 case "$mode" in
-  upload) echo "WebDAV 上传完成：$done_count 个文件 -> $dest" ;;
+  upload)
+    if [ "$skipped_count" -gt 0 ]; then
+      echo "WebDAV 上传完成：$done_count 个成功，$skipped_count 个因服务端错误跳过 -> $dest"
+    else
+      echo "WebDAV 上传完成：$done_count 个文件 -> $dest"
+    fi
+    ;;
   delete) echo "WebDAV 删除完成：$done_count 个目标 -> $dest" ;;
 esac
