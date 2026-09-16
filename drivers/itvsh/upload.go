@@ -27,11 +27,18 @@ import (
 //  1. 换上传 token（uploadType=0）
 //  2. 分块并发 POST 到 {forwardUrl}/nasforward/file/binary/upload，
 //     每块的 fileName 参数是「原名 + .crash」，offset 为该块起始位置
-//  3. 全部传完后收尾：exist 检查同名 -> 有则先删 -> 把 .crash 改名回真名
+//  3. 全部传完后收尾：exist 检查同名 -> 有则先挪走 -> 把 .crash 改名回真名
+//
+// 任一环节失败都**不会**清理 .crash：残留是「这次没走完」的证据，
+// 错误信息里会带上它的位置，交给人决定重传还是手动删。
 func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
 	dir := normalizePath(dstDir.GetPath())
 	name := file.GetName()
 	fullPath := joinPath(dir, name)
+	// 中途失败时服务器上会留下这个半成品。它**不会**被静默删掉：
+	// 残留本身就是「这次上传没走完」的证据，删掉等于把失败痕迹一起抹了。
+	// 所有失败路径都通过 residual 把它的位置带回给上层。
+	crashPath := joinPath(dir, name+".crash")
 
 	// 上传前先清掉可能残留的 .crash（上次中断留下的）
 	_, _ = d.nasProxy(ctx, methodDeleteFile, base.Json{
@@ -39,11 +46,15 @@ func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStr
 		"filename":  name + ".crash",
 	})
 
+	// residual 给错误补上残留位置，免得上层只看到一句笼统的“上传失败”。
+	residual := func(err error) error {
+		return fmt.Errorf("%w；服务器上残留未完成文件 %s，可重新上传覆盖或手动删除", err, crashPath)
+	}
+
 	token, err := d.getToken(ctx, fullPath, uploadTypeUpload)
 	if err != nil {
 		return err
 	}
-
 	size := file.GetSize()
 	uploadUrl := d.forwardUrl() + pathPutFile
 
@@ -58,16 +69,6 @@ func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStr
 		chunks = 1
 	}
 	thread := min(int(chunks), d.UploadThread)
-
-	// 取消时清理残留的 .crash，避免留下垃圾文件
-	defer func() {
-		if utils.IsCanceled(ctx) {
-			_, _ = d.nasProxy(context.Background(), methodDeleteFile, base.Json{
-				"directory": dir,
-				"filename":  name + ".crash",
-			})
-		}
-	}()
 
 	threadG, uploadCtx := errgroup.NewOrderedGroupWithContext(ctx, thread,
 		retry.Attempts(3),
@@ -162,10 +163,12 @@ func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStr
 	}
 
 	if err := threadG.Wait(); err != nil {
-		return err
+		// 走到这里说明有分块重试耗尽后仍失败（或被取消）。
+		// 服务器上必然留着 name.crash，明确告诉调用方它在哪。
+		return residual(err)
 	}
 	if utils.IsCanceled(ctx) {
-		return ctx.Err()
+		return residual(ctx.Err())
 	}
 
 	// 上传过程中收到的 set-cookie（含 WAF 挑战 cookie）落库，重启后仍可复用
@@ -177,26 +180,65 @@ func (d *Itvsh) upload(ctx context.Context, dstDir model.Obj, file model.FileStr
 }
 
 // finalizeUpload 收尾：把「文件名.crash」变成正式文件。
-// 若已存在同名文件，需先删除，否则重命名会失败。
+//
+// 存在同名文件时不能直接删——上游 rename 不允许覆盖，但「先删真文件再改名」
+// 一旦改名失败就是真文件已丢、只剩 .crash 的数据损失。这里改成可回滚的三步：
+//  1. 真文件改名为 .openlist_to_delete（腾出名字，且内容还在）
+//  2. .crash 改名为真名
+//  3. 删除 .openlist_to_delete
+//
+// 第 2 步失败时把备份改回原名，确保不丢数据。
 func (d *Itvsh) finalizeUpload(ctx context.Context, dir, name string) error {
+	crashPath := joinPath(dir, name+".crash")
+	backupName := name + ".openlist_to_delete"
+
+	// 收尾阶段数据已经完整传完，纯属元数据操作，值得重试
+	// —— 这里失败一次，用户看到的就是「白传了」，代价不对等。
+	rename := func(from, to string) error {
+		return retry.Do(func() error {
+			_, err := d.nasProxy(ctx, methodFileRename, base.Json{
+				"directory":   dir,
+				"filename":    from,
+				"newFilename": to,
+			})
+			return err
+		}, retry.Attempts(3), retry.Delay(time.Second),
+			retry.DelayType(retry.BackOffDelay), retry.Context(ctx))
+	}
+
 	exists, err := d.fileExist(ctx, dir, name)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w；数据已传完但收尾未执行，服务器上残留 %s，可重新上传覆盖或手动改名", err, crashPath)
 	}
-	if exists {
-		if _, err := d.nasProxy(ctx, methodDeleteFile, base.Json{
-			"directory": dir,
-			"filename":  name,
-		}); err != nil {
-			return fmt.Errorf("delete existing file failed: %w", err)
+
+	if !exists {
+		if err := rename(name+".crash", name); err != nil {
+			return fmt.Errorf("%w；数据已传完但改名失败，服务器上残留 %s，可重新上传覆盖或手动改名", err, crashPath)
 		}
+		return nil
 	}
-	_, err = d.nasProxy(ctx, methodFileRename, base.Json{
-		"directory":   dir,
-		"filename":    name + ".crash",
-		"newFilename": name,
-	})
-	return err
+
+	// 先把真文件挪到备份名，腾出 name 给新文件用
+	if err := rename(name, backupName); err != nil {
+		return fmt.Errorf("%w；数据已传完但无法移开同名旧文件，服务器上残留 %s，可重新上传覆盖或手动改名", err, crashPath)
+	}
+	// 第 2 步失败则回滚第 1 步：宁可回到「新旧并存」的初始状态，也不能丢旧文件
+	if err := rename(name+".crash", name); err != nil {
+		if rerr := rename(backupName, name); rerr != nil {
+			return fmt.Errorf("%w；改名失败，且旧文件回滚也失败（旧文件现为 %s ，新数据在 %s），请手动处理",
+				err, joinPath(dir, backupName), crashPath)
+		}
+		return fmt.Errorf("%w；数据已传完但改名失败，服务器上残留 %s，可重新上传覆盖或手动改名", err, crashPath)
+	}
+	// 新文件已就位，清理备份。这步失败只留下垃圾文件，不影响正确性，不向上报错
+	// —— 报错会让调用方以为上传失败从而重传，而文件其实是对的。
+	if _, err := d.nasProxy(ctx, methodDeleteFile, base.Json{
+		"directory": dir,
+		"filename":  backupName,
+	}); err != nil {
+		utils.Log.Warnf("[zhi] upload ok but failed to remove backup %s: %v", joinPath(dir, backupName), err)
+	}
+	return nil
 }
 
 // checkChunkResult 解析分块上传响应。

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 把构建产物上传到 WebDAV。
+# 上传文件到 WebDAV，或删除 WebDAV 上的文件。
 #
 # 环境变量：
 #   WEBDAV_URL        WebDAV 根地址，如 https://dav.example.com/openlist
@@ -8,22 +8,35 @@
 #   WEBDAV_PASSWORD   密码
 #   WEBDAV_REMOTE_DIR 可选，远程子目录，可含多级（如 a/b）
 #
-# 用法：upload-webdav.sh <文件> [文件...]
+# 用法：
+#   upload-webdav.sh <本地文件> [本地文件...]        上传，落到远端同名位置
+#   upload-webdav.sh --delete <远端名字> [名字...]   删除远端同名文件
 #
 # 未配置 WEBDAV_URL 时打印 notice 并成功退出 —— 这样 fork 出来、
-# 或没配 secret 的人跑同一个 workflow 也不会因为上传而失败。
+# 或没配 secret 的人跑同一个 workflow 也不会因为上传/删除而失败。
 
 set -euo pipefail
 
+mode="upload"
+if [ "${1:-}" = "--delete" ]; then
+  mode="delete"
+  shift
+fi
+
 if [ -z "${WEBDAV_URL:-}" ]; then
-  echo "::notice::WEBDAV_URL 未配置，跳过 WebDAV 上传"
+  echo "::notice::WEBDAV_URL 未配置，跳过 WebDAV ${mode}"
   exit 0
 fi
 if [ -z "${WEBDAV_USERNAME:-}" ] || [ -z "${WEBDAV_PASSWORD:-}" ]; then
-  echo "::warning::WEBDAV_URL 已配置，但缺少 WEBDAV_USERNAME / WEBDAV_PASSWORD，跳过上传"
+  echo "::warning::WEBDAV_URL 已配置，但缺少 WEBDAV_USERNAME / WEBDAV_PASSWORD，跳过 ${mode}"
   exit 0
 fi
 if [ "$#" -eq 0 ]; then
+  if [ "$mode" = "delete" ]; then
+    # 清理名单可能为空（例如 Release 里一个 7z 都没有），不是错误。
+    echo "::notice::未传入待删除的远端名字，无需操作"
+    exit 0
+  fi
   echo "::error::未传入待上传文件"
   exit 1
 fi
@@ -57,8 +70,9 @@ mkcol() {
   esac
 }
 
-# 逐级创建，部分 WebDAV 服务不会自动建父目录。
-if [ -n "$remote_dir" ]; then
+# 删模式不去建目录：要删的前提是目录已存在，真不存在时 DELETE 会 404，
+# 下面按「目标不存在」容忍掉即可 —— 顺手 MKCOL 一个空目录是不该有的副作用。
+if [ "$mode" = "upload" ] && [ -n "$remote_dir" ]; then
   acc="$base"
   IFS='/' read -ra parts <<<"$remote_dir"
   for p in "${parts[@]}"; do
@@ -71,19 +85,38 @@ fi
 dest="$base"
 [ -n "$remote_dir" ] && dest="$base/$remote_dir"
 
-uploaded=0
+done_count=0
 for f in "$@"; do
-  if [ ! -f "$f" ]; then
-    echo "::error::文件不存在：$f"
-    exit 1
-  fi
-  name="$(basename "$f")"
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -T "$f" "$dest/$name" || true)
-  case "$code" in
-    200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
-    *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
+  case "$mode" in
+    upload)
+      if [ ! -f "$f" ]; then
+        echo "::error::文件不存在：$f"
+        exit 1
+      fi
+      name="$(basename "$f")"
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -T "$f" "$dest/$name" || true)
+      case "$code" in
+        200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
+        *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
+      esac
+      ;;
+    delete)
+      # 这里传进来的就是远端文件名本身，不做 basename 处理，
+      # 以免调用方本想删子路径时被静默截断。
+      name="$f"
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -X DELETE "$dest/$name" || true)
+      case "$code" in
+        200|204) echo "  已删除 $dest/$name (HTTP $code)" ;;
+        # 404 是预期情况：变体失败时根本没传过 txt。不算错误。
+        404) echo "  目标不存在，跳过 $dest/$name (HTTP 404)" ;;
+        *) echo "::error::删除失败 $dest/$name (HTTP $code)"; exit 1 ;;
+      esac
+      ;;
   esac
-  uploaded=$((uploaded + 1))
+  done_count=$((done_count + 1))
 done
 
-echo "WebDAV 上传完成：$uploaded 个文件 -> $dest"
+case "$mode" in
+  upload) echo "WebDAV 上传完成：$done_count 个文件 -> $dest" ;;
+  delete) echo "WebDAV 删除完成：$done_count 个目标 -> $dest" ;;
+esac
