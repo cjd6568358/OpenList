@@ -8,26 +8,29 @@ name: Minimal Build
 #   2. 新增两种非静态-链接的 linux 变体（见下）
 #   3. 新增 lite 前端变体
 #   4. 新增 UPX 压缩变体
-#   5. 新增 WebDAV 产物清单上传（当前只传 txt，不传 7z）
-#   6. 新增「汇总」job：等全部变体跑完后，把各变体各自生成的单变体 txt
-#      删掉，换成一份按代理域名分组、列出该 Release 全部产物的 proxy.txt
+#   5. 新增 WebDAV 产物清单上传（只传 txt，不传 7z）
+#   6. 新增「汇总」job：等全部变体跑完后，生成一份按代理域名分组、
+#      列出该 Release 全部产物的 proxy_<sha>.txt 并上传到 WebDAV。
+#      这是全局唯一产生下载清单、且唯一写 WebDAV 的地方（见下）。
 #
 # 产物分发渠道（两条，互不影响）：
-#   GitHub Release  7z 产物本体。proxy.txt 里的加速地址指向这里，
+#   GitHub Release  7z 产物本体。proxy_<sha>.txt 里的加速地址指向这里，
 #                   所以它是下载链路的最终来源，WebDAV 只是清单托管处。
-#   WebDAV          只传「下载地址 txt」（22~25 份单变体 + 1 份 proxy.txt）。
+#   WebDAV          只传一份 proxy_<sha>.txt（下载地址清单）。
 #                   7z 不传 —— 几十 MB × 25 个变体是重复占用，而 txt 里的
 #                   加速地址指向 Release、不经过 WebDAV，代理下载已够用。
-#                   想恢复 7z 镜像：见 "Upload to WebDAV" 步骤的注释。
+#                   想恢复 7z 镜像：见 summarize 里 "Upload to WebDAV" 的注释。
 #
-# 下载地址 txt 的两个阶段（WebDAV <WEBDAV_DIR>/<commit>/）：
-#   构建中：25 份 openlist_<变体>.txt，各自只含自己那个产物。
-#           目的 —— 某个变体一编译完即可拿到加速下载地址，
-#           不必等其它 24 个变体跑完。这是本 workflow 刻意的过渡态。
-#   结束后：删除上面全部，只留一份 proxy.txt，列出成功的全部产物，
-#           并把它作为正文发一封邮件。
-#           build 失败/被 cancel 时 summarize 不跑，过渡态就是最终态，
-#           此时至少每份 txt 对应的产物都是真实存在且可用的。
+# 下载地址清单只在一个地方产生（WebDAV <WEBDAV_DIR>/，无 commit 子目录）：
+#   summarize 生成 proxy_<sha>.txt，列出该 Release 里成功的全部产物，
+#   上传后把它作为正文发一封邮件。
+#   commit 体现在文件名里而不是目录层 —— 每个 commit 只有这一个文件，
+#   为它单开一层目录只是徒增嵌套。
+#   build job 完全不经手 WebDAV：它只把 7z 交给 GitHub Release。
+#
+#   ⚠ 代价：下载地址要等 build 全部跑完才可用。build 失败/被 cancel 时
+#   summarize 不跑（它靠 always() 只在 build 结束后启动），此时 WebDAV 上
+#   可能没有清单 —— 从 Release 页面取产物即可，Release 是源头。
 #
 # 邮件配置（仓库 Settings → Secrets and variables → Actions 里加）：
 #   vars.SMTP_HOST          SMTP 服务器，如 smtp.qq.com
@@ -412,15 +415,14 @@ jobs:
       - name: Publish to GitHub Release
         # 产出永久公开直链，形如：
         #   https://github.com/cjd6568358/OpenList/releases/download/ci-<sha>/<asset>
-        # 与 WebDAV 那步完全独立，互不影响。
+        # 与 WebDAV 那步完全独立：这边只负责 7z，WebDAV 只放清单文本。
         #
-        # 与 proxy.txt 的先后关系：txt 里拼的就是这里的 asset URL。
+        # 与代理清单的先后关系：txt 里拼的就是这里的 asset URL。
         # 但生成 txt 已挪到 summarize job，靠 needs: build 保证本 job 全跑完
         # 才开始 —— 所以这里不需要关心顺序，只要不把上传挪到 job 外面即可。
         #
         # tag 用 ci-<commit>：每个 commit 一个 Release，永久归档、互不覆盖。
-        # 因为 tag 里已含 commit，asset 名就不再重复带 commit，与 WebDAV 上
-        # 的文件名保持一致，便于两边对照。
+        # 因为 tag 里已含 commit，asset 名就不再重复带 commit。
         #
         # ⚠ 25 个 matrix job 并发跑这一段，必然有多个 job 同时想创建同一个
         #   Release。谁先谁赢，其余拿到 422 —— 那不是错误，故显式容忍。
@@ -460,62 +462,22 @@ jobs:
           gh release upload "$tag" build/*.7z --clobber
           echo "::notice::release $tag 已更新"
 
-      - name: Generate proxy download links (this variant)
-        # 紧跟在自己的 gh release upload 之后：此时本变体的 asset 必然已存在，
-        # 所以直接按名字拼链接，不去查 Release（省一次 API 调用）。
-        # 目的：尽早给出可用的加速下载地址 —— 不必等 25 个变体全跑完。
-        # ⚠ 必须排在 Publish to GitHub Release 之后，否则是死链。
-        env:
-          SHA: ${{ steps.short-sha.outputs.sha }}
-          TARGET: ${{ matrix.target }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -e
-          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
-          bash .github/scripts/gen-proxy-txt.sh \
-            "ci-${SHA}" "${REPO}" "build/${name}.txt" "${name}.7z"
-
-      - name: Upload to WebDAV
-        # 脚本在 WEBDAV_URL 未配置时会打 notice 并成功退出，不会挂掉 job。
-        # 布局：<WEBDAV_DIR>/<commit>/
-        #   openlist_<target>_<frontend>_<compress>.txt   本变体的加速下载地址
-        #   openlist_<target>_<frontend>_<compress>.7z    压缩后的产物（当前不传，见下）
-        # commit 作为目录层：按构建批次归档，便于翻查/回滚。
-        # 同 commit 重跑会覆盖同名文件（幂等），不会堆积。
-        #
-        # ⚠ 当前只传 txt，不传 7z —— 7z 是几十 MB × 25 个变体的大块，
-        #   而 txt 里的加速地址指向 GitHub Release（不经过 WebDAV），
-        #   代理下载已经够用，WebDAV 上再存一份 7z 是重复占用。
-        #   想恢复镜像：把下面命令末尾的 "build/${name}.7z" 参数加回去即可。
-        #   注意两者原本在同一次调用里，摘 7z 时务必保留 txt 参数。
-        #
-        # ⚠ 这些单变体 txt 只是**过渡产物**：summarize 会在全部变体跑完后
-        #   把它们删掉，换成汇总版的 proxy.txt。见文件末尾。
-        env:
-          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-          WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
-          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-          WEBDAV_REMOTE_DIR: ${{ vars.WEBDAV_DIR }}/${{ steps.short-sha.outputs.sha }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -e
-          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
-          # 7z 已按需摘除；恢复时在行尾补回 "build/${name}.7z"。
-          bash .github/scripts/upload-webdav.sh "build/${name}.txt"
-
   summarize:
     # 等 build 全部跑完（无论成败）再执行。
     # always() 是必须的：不加的话任一变体失败就整片跳过，
     # 而「部分变体失败 + 其余成功的产物」正是最需要清单的时候。
     # 失败变体不会出现在 Release 里，所以清单自动只含成功产物。
     #
-    # 职责：(1) 生成并上传汇总版的 proxy.txt
-    #       (2) 把 proxy.txt 正文发一封邮件
-    #       (3) 删掉 build 阶段各变体传的单变体 txt
-    # 顺序是「先生成并上传、再发信、最后删除」：删除是破坏性且不可恢复的，
-    # 排在最后，任何前面出错时旧清单都还在。
-    # 放在 build 跑的过程中，WebDAV 目录里是 25 份单变体 txt ——
-    # 那是刻意的过渡态：让加速地址尽早可用，不必等全量构建结束。
+    # 职责：(1) 生成汇总版 proxy_<sha>.txt（列出该 Release 里成功的全部产物）
+    #       (2) 上传到 WebDAV
+    #       (3) 把它作为正文发一封邮件
+    # 顺序是「先上传、再发信」：邮件说出「已经在 WebDAV 上」时，它确实在。
+    #
+    # 这是全局唯一一处 WebDAV 上传，也是唯一产生下载清单的地方 ——
+    #   build job 不生成 txt、不上传 WebDAV，只把 7z 交给 GitHub Release。
+    #   (a) WebDAV 写入从 25 个并发点收敛成 1 个，不再有并发建同一串目录的
+    #   竞态，也就没有了反代限流下的 502；(b) 目录层取消，commit 挪进文件名。
+    # 代价：下载地址不再「编译完即可用」，要等 build 全部结束。
     needs: build
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -529,39 +491,61 @@ jobs:
         id: short-sha
 
       - name: Generate proxy download links
-        # 一次性为该 Release 里的**全部**产物生成一份 txt，按代理域名分组。
-        # 产物清单由脚本问 GitHub 要（gh release view），不写死。
+        # 为该 Release 里的**全部**产物生成一份 txt，按代理域名分组。
+        # 产物清单由脚本问 GitHub 要（gh release view），不写死 ——
+        # matrix 增删变体后无需改这里，失败的变体没进 Release 也就不在其中。
+        #
+        # 输出文件名带 commit：proxy_<sha>.txt。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.short-sha.outputs.sha }}
         run: |
           set -e
-          bash .github/scripts/gen-proxy-txt.sh "ci-${SHA}" "${REPO}" proxy.txt
+          bash .github/scripts/gen-proxy-txt.sh "ci-${SHA}" "${REPO}" "proxy_${SHA}.txt"
 
       - name: Upload to WebDAV
-        # proxy.txt -> <WEBDAV_DIR>/<commit>/proxy.txt
-        # 与各变体 7z 落在同一 commit 目录下，便于一起翻查。
-        # 脚本在无产物时不生成文件，这里先判存在再交给上传脚本。
+        # 全局唯一一处 WebDAV 上传，只传一份 proxy_<sha>.txt。
+        #
+        # 目录层级已取消（不再有 <commit>/ 这一层）：WEBDAV_REMOTE_DIR 直接
+        #   是 WEBDAV_DIR，commit 体现在文件名里。每个 commit 只有这一个文件，
+        #   为它单开一层目录只是徒增层级。
+        #
+        # 建目录由 upload-webdav.sh 自己做（只建叶子目录，见脚本注释）：
+        #   整条链上只有这一个上传方，不存在并发建同一串目录的竞态，
+        #   所以不需要单独的前置 job。
+        #
+        # WEBDAV_DIR 必须配：布局取消 <commit>/ 这一层后，它成了唯一的
+        #   目录约束。留空等于把文件倒进 WebDAV 根目录 —— 脚本对空
+        #   remote_dir 的行为正是「传到根目录」，所以在这里挡住。
         env:
           WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
           WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
           WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-          WEBDAV_REMOTE_DIR: ${{ vars.WEBDAV_DIR }}/${{ steps.short-sha.outputs.sha }}
+          WEBDAV_REMOTE_DIR: ${{ vars.WEBDAV_DIR }}
         run: |
           set -e
-          if [ ! -f proxy.txt ]; then
-            echo "::notice::未生成 proxy.txt（release 无 7z 产物），跳过上传"
+          if [ -z "${WEBDAV_REMOTE_DIR// }" ]; then
+            # 未配 WebDAV_URL 时本步本就不做事，那种情况不拦。
+            if [ -n "${WEBDAV_URL:-}" ]; then
+              echo "::error::vars.WEBDAV_DIR 未配置，拒绝上传到 WebDAV 根目录"
+              exit 1
+            fi
+          fi
+          if [ ! -f "proxy_${SHA}.txt" ]; then
+            echo "::notice::未生成 proxy_${SHA}.txt（release 无 7z 产物），跳过上传"
             exit 0
           fi
-          bash .github/scripts/upload-webdav.sh proxy.txt
+          bash .github/scripts/upload-webdav.sh "proxy_${SHA}.txt"
 
-      - name: Send proxy.txt by mail
-        # 正文就是 proxy.txt 原文，方便不翻 WebDAV 也能拿到加速地址。
-        # 排在 proxy.txt 上传之后 —— 邮件里说的内容此时确实已经在 WebDAV 上。
+      - name: Send proxy list by mail
+        # 正文就是 proxy_<sha>.txt 原文，方便不翻 WebDAV 也能拿到加速地址。
+        # 排在 WebDAV 上传之后 —— 邮件里说的内容此时确实已经在 WebDAV 上。
+        # MAIL_BODY_FILE 指到带 commit 的文件名上（脚本默认值仍是 proxy.txt）。
         #
-        # continue-on-error：邮件只是通知，不该拖累构建结果，更不该因为它失败
-        # 就跳过后面那步破坏性的清理（删除排在最后，见下）。
+        # 文件不存在时脚本自己打 notice 后返回 0，不发空邮件。
+        #
+        # continue-on-error：邮件只是通知，不该拖累构建结果。
         # 配置不全时脚本自己打 notice 后返回 0，不影响任何人。
         #
         # 配置来源：服务器/端口/发件地址放 vars（非敏感，且写错了能在
@@ -575,44 +559,6 @@ jobs:
           MAIL_FROM: ${{ vars.MAIL_FROM }}
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_BODY_FILE: proxy_${{ steps.short-sha.outputs.sha }}.txt
           MAIL_SUBJECT: OpenList CI 构建产物 ${{ steps.short-sha.outputs.sha }}
         run: python3 .github/scripts/send-mail.py
-
-      - name: Remove per-variant txt files
-        # build job 为了「尽早给出下载地址」各传了一份单变体 txt，
-        # 汇总版现在已经落地，把它们删掉 —— 同一个目录里两份语义重叠、
-        # 格式不同的清单会让人不知道该信哪个。
-        #
-        # 排在 proxy.txt **上传之后**，不是生成之后：这样任何时刻目录里
-        # 至少有一份可用清单。若本步排在前面，一旦上传那步失败（网络/凭据），
-        # 旧的单变体 txt 已删、新的还没上去，就什么都不剩了。
-        #
-        # 名单从 Release 的 asset 推导：build job 只在 Release 上传成功后
-        # 才写 txt，所以「有 7z 的变体」恰好是「可能有 txt 的变体」这个全集。
-        # 失败变体没传过 txt，DELETE 会 404，脚本按预期容忍。
-        # 这样就不必用 PROPFIND 去扫目录（bash 里解析 XML 很脆）。
-        #
-        # ⚠ 若 proxy.txt 因故没生成（Release 里一个 7z 都没有），
-        #   这里也会因名单为空而跳过 —— 不会把仅有的东西删掉。
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ steps.short-sha.outputs.sha }}
-          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-          WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
-          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-          WEBDAV_REMOTE_DIR: ${{ vars.WEBDAV_DIR }}/${{ steps.short-sha.outputs.sha }}
-        run: |
-          set -e
-          # .7z -> .txt 映射出待删名单。Release 不存在或无产物时为空，
-          # 删除脚本会打 notice 后正常退出。
-          txts="$(gh release view "ci-${SHA}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null \
-            | grep '\.7z$' | sed 's/\.7z$/.txt/' | sort || true)"
-
-          if [ -z "$txts" ]; then
-            echo "::notice::无变体产物，跳过清理单变体 txt"
-            exit 0
-          fi
-
-          # shellcheck disable=SC2086  # 需要按空白拆分成多个参数
-          bash .github/scripts/upload-webdav.sh --delete $txts

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 上传文件到 WebDAV，或删除 WebDAV 上的文件。
+# 上传文件到 WebDAV。
 #
 # 环境变量：
 #   WEBDAV_URL        WebDAV 根地址，如 https://dav.example.com/openlist
@@ -9,38 +9,31 @@
 #   WEBDAV_REMOTE_DIR 可选，远程子目录，可含多级（如 a/b）
 #
 # 用法：
-#   upload-webdav.sh <本地文件> [本地文件...]        上传，落到远端同名位置
-#   upload-webdav.sh --delete <远端名字> [名字...]   删除远端同名文件
+#   upload-webdav.sh <本地文件> [本地文件...]   上传，落到远端同名位置
+#
+# 上传会先确保 WEBDAV_REMOTE_DIR 存在再 PUT，因此**不依赖任何前置 job**
+#   去预先建目录：每个 job 各自跑本脚本都能成功，无需 needs: 一个建目录的
+#   job 来保证顺序。OpenList 的 MKCOL 不会自动补建中间目录（缺父目录直接
+#   409），所以脚本自己按需逐级补建 —— 见 ensure_dir 的注释。
+#   建目录是幂等的：重跑同一 commit 会拿到 405（已存在），按正常处理。
 #
 # 未配置 WEBDAV_URL 时打印 notice 并成功退出 —— 这样 fork 出来、
-# 或没配 secret 的人跑同一个 workflow 也不会因为上传/删除而失败。
+# 或没配 secret 的人跑同一个 workflow 也不会因为上传而失败。
 #
-# 失败处理：上传 .txt 遇到 5xx（WebDAV 瞬时错误）时打 warning 并跳过该
-#   文件、继续传后面的，不让 job 变红；7z 或其它 4xx 仍然硬失败。
-#   详见下面 upload 分支里的注释。
+# 失败处理：一律硬失败。任何 HTTP 非 201/204 或传输出错都报 error 并退出 1。
+#   瞬时 5xx 由 curl --retry 退避吸收；退避后仍失败即为真故障，不该吞掉。
 
 set -euo pipefail
 
-mode="upload"
-if [ "${1:-}" = "--delete" ]; then
-  mode="delete"
-  shift
-fi
-
 if [ -z "${WEBDAV_URL:-}" ]; then
-  echo "::notice::WEBDAV_URL 未配置，跳过 WebDAV ${mode}"
+  echo "::notice::WEBDAV_URL 未配置，跳过 WebDAV 上传"
   exit 0
 fi
 if [ -z "${WEBDAV_USERNAME:-}" ] || [ -z "${WEBDAV_PASSWORD:-}" ]; then
-  echo "::warning::WEBDAV_URL 已配置，但缺少 WEBDAV_USERNAME / WEBDAV_PASSWORD，跳过 ${mode}"
+  echo "::warning::WEBDAV_URL 已配置，但缺少 WEBDAV_USERNAME / WEBDAV_PASSWORD，跳过上传"
   exit 0
 fi
 if [ "$#" -eq 0 ]; then
-  if [ "$mode" = "delete" ]; then
-    # 清理名单可能为空（例如 Release 里一个 7z 都没有），不是错误。
-    echo "::notice::未传入待删除的远端名字，无需操作"
-    exit 0
-  fi
   echo "::error::未传入待上传文件"
   exit 1
 fi
@@ -60,92 +53,93 @@ chmod 600 "$rc"
 esc() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
 printf 'user = "%s:%s"\n' "$(esc "$WEBDAV_USERNAME")" "$(esc "$WEBDAV_PASSWORD")" >"$rc"
 
-# 建目录。405/301/302 表示已存在或已重定向，都不影响后续 PUT，
-# 因此只对真正的异常码告警，不中断上传。
-# 注意 curl 失败时 -w '%{http_code}' 仍会打印 000，所以只需补 `|| true`
-# 压掉非零退出码（否则 set -e 会中断），不能再 echo 一次 000。
-mkcol() {
-  local url="$1" code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -X MKCOL "$url" || true)
-  case "$code" in
-    201) echo "  已创建 $url" ;;
-    405|301|302) echo "  已存在 $url ($code)" ;;
-    *) echo "::warning::MKCOL $url -> HTTP $code" ;;
-  esac
+# 建目录，使 dest 可用。**不依赖调用方先建好任何目录** —— 每个 job 各自
+#   跑本脚本都不会失败，不需要 needs: 一个前置 job 来保证顺序。
+#
+# 返回码语义（对应 OpenList server/webdav/webdav.go 的 handleMkcol）：
+#   201 已创建   —— 正常路径
+#   405 已存在   —— RFC 4918 9.3.1 规定 MKCOL 只能作用于未映射的 URL。
+#                   重跑时走到这里，属正常，不是错误。
+#   409 父目录不存在 —— 服务端不会自动补建中间目录，需逐级补建。
+#
+# 策略：先试整条路径（1 次请求，稳态下就是 405，最常见）。
+#   只有 409 才逐级补建 —— 这样普通路径不会为每层都发一次 MKCOL，
+#   而多级路径首次运行时也能自愈，不必人工预建。
+#
+# 用 --retry 吸收瞬时 5xx（反代限流）。
+# 注意 curl 失败时 -w '%{http_code}' 仍会打印 000，所以补 `|| true` 压掉
+# 非零退出码（否则 set -e 会中断），不能再 echo 一次 000。
+mkcol_once() {
+  curl -sS -o /dev/null -w '%{http_code}' -K "$rc" \
+    --retry 3 --retry-delay 2 --retry-max-time 60 \
+    -X MKCOL "$1" || true
 }
 
-# 删模式不去建目录：要删的前提是目录已存在，真不存在时 DELETE 会 404，
-# 下面按「目标不存在」容忍掉即可 —— 顺手 MKCOL 一个空目录是不该有的副作用。
-if [ "$mode" = "upload" ] && [ -n "$remote_dir" ]; then
-  acc="$base"
-  IFS='/' read -ra parts <<<"$remote_dir"
+ensure_dir() {
+  # $1 = base，$2 = 规整后的相对路径（可空）
+  local acc="$1" code
+  local rel="$2"
+
+  if [ -z "$rel" ]; then
+    return 0          # 直接传到 base，无需建任何目录
+  fi
+
+  code="$(mkcol_once "$acc/$rel")"
+  case "$code" in
+    201) echo "  已创建 $acc/$rel"; return 0 ;;
+    405) echo "  已存在 $acc/$rel (405)"; return 0 ;;
+    409) : ;;         # 父目录缺失，落到下面逐级补建
+    *) echo "::error::创建目录失败 $acc/$rel -> HTTP $code"; exit 1 ;;
+  esac
+
+  # 逐级补建：从最外层开始，每建好一层再往下走，缺哪层补哪层。
+  echo "  父目录缺失，逐级创建：$rel"
+  local parts=() p
+  IFS='/' read -ra parts <<<"$rel"
   for p in "${parts[@]}"; do
     [ -z "$p" ] && continue
     acc="$acc/$p"
-    mkcol "$acc"
+    code="$(mkcol_once "$acc")"
+    case "$code" in
+      201) echo "  已创建 $acc" ;;
+      405) echo "  已存在 $acc (405)" ;;
+      409)
+        # 连第一层都建不出来，说明缺的不是中间目录而是 base 本身 ——
+        # base 是 WEBDAV_URL 指向的挂载根，本脚本不去创建它（那是部署方
+        # 的职责），这里报清楚是配置问题，而不是含糊地怪到中间目录头上。
+        if [ "$acc" = "$1/${parts[0]}" ]; then
+          echo "::error::${1} 不存在（WEBDAV_URL 指向的目录缺失），无法创建 $acc"
+        else
+          echo "::error::创建目录失败 $acc -> HTTP 409（父目录不存在）"
+        fi
+        exit 1
+        ;;
+      *) echo "::error::创建目录失败 $acc -> HTTP $code"; exit 1 ;;
+    esac
   done
+}
+
+ensure_dir "$base" "$remote_dir"
+if [ -n "$remote_dir" ]; then
+  dest="$base/$remote_dir"
+else
+  dest="$base"
 fi
 
-dest="$base"
-[ -n "$remote_dir" ] && dest="$base/$remote_dir"
-
-done_count=0
-skipped_count=0
 for f in "$@"; do
-  case "$mode" in
-    upload)
-      if [ ! -f "$f" ]; then
-        echo "::error::文件不存在：$f"
-        exit 1
-      fi
-      name="$(basename "$f")"
-      code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -T "$f" "$dest/$name" || true)
-      case "$code" in
-        200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
-        5*)
-          # 服务端瞬时错误（502/503/504…）。并发 25 个 matrix job 打同一台
-          # WebDAV 时这类抖动是常态。
-          #
-          # 只对 .txt 容忍，且**必须用 continue 而不是 break/exit**：
-          # 调用方是 upload-webdav.sh <txt> <7z>，txt 排在前面，
-          # 这里一 exit 就会把后面的 7z 一起丢掉。
-          # txt 本身是「尽早可用」的过渡产物，内容又指向 Release
-          # （不经过 WebDAV），传不上去不影响任何人拿到下载地址。
-          # 7z 是镜像主体，传不上去仍然报错 —— 不把它一起吞掉。
-          if [ "${name##*.}" = "txt" ]; then
-            echo "::warning::上传失败 $f -> $dest/$name (HTTP $code)，跳过继续"
-            skipped_count=$((skipped_count + 1))
-            continue
-          fi
-          echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"
-          exit 1
-          ;;
-        *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
-      esac
-      ;;
-    delete)
-      # 这里传进来的就是远端文件名本身，不做 basename 处理，
-      # 以免调用方本想删子路径时被静默截断。
-      name="$f"
-      code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" -X DELETE "$dest/$name" || true)
-      case "$code" in
-        200|204) echo "  已删除 $dest/$name (HTTP $code)" ;;
-        # 404 是预期情况：变体失败时根本没传过 txt。不算错误。
-        404) echo "  目标不存在，跳过 $dest/$name (HTTP 404)" ;;
-        *) echo "::error::删除失败 $dest/$name (HTTP $code)"; exit 1 ;;
-      esac
-      ;;
+  if [ ! -f "$f" ]; then
+    echo "::error::文件不存在：$f"
+    exit 1
+  fi
+  name="$(basename "$f")"
+  # --retry 同样吸收瞬时 5xx；4xx（如权限、路径不对）不重试。
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" \
+    --retry 3 --retry-delay 2 --retry-max-time 120 \
+    -T "$f" "$dest/$name" || true)
+  case "$code" in
+    200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
+    *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
   esac
-  done_count=$((done_count + 1))
 done
 
-case "$mode" in
-  upload)
-    if [ "$skipped_count" -gt 0 ]; then
-      echo "WebDAV 上传完成：$done_count 个成功，$skipped_count 个因服务端错误跳过 -> $dest"
-    else
-      echo "WebDAV 上传完成：$done_count 个文件 -> $dest"
-    fi
-    ;;
-  delete) echo "WebDAV 删除完成：$done_count 个目标 -> $dest" ;;
-esac
+echo "WebDAV 上传完成：$# 个文件 -> $dest"
