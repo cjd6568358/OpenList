@@ -8,9 +8,17 @@ name: Minimal Build
 #   2. 新增两种非静态-链接的 linux 变体（见下）
 #   3. 新增 lite 前端变体
 #   4. 新增 UPX 压缩变体
-#   5. 新增 WebDAV 产物上传
+#   5. 新增 WebDAV 产物清单上传（当前只传 txt，不传 7z）
 #   6. 新增「汇总」job：等全部变体跑完后，把各变体各自生成的单变体 txt
 #      删掉，换成一份按代理域名分组、列出该 Release 全部产物的 proxy.txt
+#
+# 产物分发渠道（两条，互不影响）：
+#   GitHub Release  7z 产物本体。proxy.txt 里的加速地址指向这里，
+#                   所以它是下载链路的最终来源，WebDAV 只是清单托管处。
+#   WebDAV          只传「下载地址 txt」（22~25 份单变体 + 1 份 proxy.txt）。
+#                   7z 不传 —— 几十 MB × 25 个变体是重复占用，而 txt 里的
+#                   加速地址指向 Release、不经过 WebDAV，代理下载已够用。
+#                   想恢复 7z 镜像：见 "Upload to WebDAV" 步骤的注释。
 #
 # 下载地址 txt 的两个阶段（WebDAV <WEBDAV_DIR>/<commit>/）：
 #   构建中：25 份 openlist_<变体>.txt，各自只含自己那个产物。
@@ -332,7 +340,8 @@ jobs:
           esac
           ls -la build/
 
-      # 产物不走 artifact 上传：只走 WebDAV(7z) 与 GitHub Release(7z)，
+      # 产物不走 artifact 上传：走 GitHub Release(7z) 本体，
+      # 外加 WebDAV 一条清单渠道（不传 7z），
       # 顺带省下每次 run 约 0.9~1.3GB 的 artifact 占用。
       # 下方保留原步骤备查，需要临时走 artifact 调试时取消注释即可。
       #
@@ -470,13 +479,15 @@ jobs:
         # 脚本在 WEBDAV_URL 未配置时会打 notice 并成功退出，不会挂掉 job。
         # 布局：<WEBDAV_DIR>/<commit>/
         #   openlist_<target>_<frontend>_<compress>.txt   本变体的加速下载地址
-        #   openlist_<target>_<frontend>_<compress>.7z    压缩后的产物
+        #   openlist_<target>_<frontend>_<compress>.7z    压缩后的产物（当前不传，见下）
         # commit 作为目录层：按构建批次归档，便于翻查/回滚。
         # 同 commit 重跑会覆盖同名文件（幂等），不会堆积。
         #
-        # 上传顺序先 txt 后 7z：txt 是个小文件，先落地能让"地址可用"更早，
-        # 不必等 7z 那一大块传完。txt 里的链接指向 Release 而非 WebDAV，
-        # 所以这个顺序不影响正确性。
+        # ⚠ 当前只传 txt，不传 7z —— 7z 是几十 MB × 25 个变体的大块，
+        #   而 txt 里的加速地址指向 GitHub Release（不经过 WebDAV），
+        #   代理下载已经够用，WebDAV 上再存一份 7z 是重复占用。
+        #   想恢复镜像：把下面命令末尾的 "build/${name}.7z" 参数加回去即可。
+        #   注意两者原本在同一次调用里，摘 7z 时务必保留 txt 参数。
         #
         # ⚠ 这些单变体 txt 只是**过渡产物**：summarize 会在全部变体跑完后
         #   把它们删掉，换成汇总版的 proxy.txt。见文件末尾。
@@ -489,7 +500,8 @@ jobs:
         run: |
           set -e
           name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
-          bash .github/scripts/upload-webdav.sh "build/${name}.txt" "build/${name}.7z"
+          # 7z 已按需摘除；恢复时在行尾补回 "build/${name}.7z"。
+          bash .github/scripts/upload-webdav.sh "build/${name}.txt"
 
   summarize:
     # 等 build 全部跑完（无论成败）再执行。
