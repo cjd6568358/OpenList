@@ -35,9 +35,13 @@ const (
 	uploadTypeDownload = 1
 )
 
-// 鉴权失效的识别。上游把「token 过期」表示为 code 1009/1011 或 msg 里的文案，
+// 鉴权失效的识别。上游把「token 过期」表示为 code 1009/1010/1011 或 msg 里的文案，
 // 这里按同样的口径判定，命中则触发会话恢复。
-var authFailureCodes = []int{1009, 1011, 401}
+// 1010 是一等公民：小程序/Web 版把它单列出来提示「您长时间未登录，请重新登录」
+// （见 mp_zhijiadisk/web/js/api.js 对 code 1010 的处理）。漏掉它的话，
+// 线上就只能靠下面 authFailureMarkers 里的 "token expired" 文案兜底，
+// 上游一改措辞恢复机制就会静默失效。
+var authFailureCodes = []int{1009, 1010, 1011, 401}
 
 var authFailureMarkers = []string{
 	"token expired",
@@ -213,9 +217,11 @@ func (d *Itvsh) cookieHeader(target string) string {
 
 // ==================== 会话 cookie 持久化 ====================
 //
-// 登录态实际由 cookie 维持：token 失效（1009）时上游是**不带密码**重取用户信息恢复的，
-// 说明会话上下文在 cookie 里。只把 jar 放内存，进程一重启就丢，会话随之失效。
-// 这里把 jar 序列化进 Addition，随存储配置一起落库。
+// 登录态实际由 cookie 维持：请求靠 cookie + X-NAS-SDKTOKEN 一起标识会话
+// （WAF 挑战 cookie 也必须带着，见 cookieHeader 的说明）。只把 jar 放内存，
+// 进程一重启就丢，反而要多花一次账密登录。这里把 jar 序列化进 Addition，
+// 随存储配置一起落库，让重启后能直接复用。
+// 注意：会话真过期时无法靠 cookie 自愈，relogin 会走完整的账密重登。
 
 // persistURLs 是 jar 的“作用域种子”。jar 以 host 为键收集 cookie，
 // 恢复时得先知道该往哪些 host 回填 —— 这两个正是本驱动会访问的域名。
@@ -288,19 +294,17 @@ func (d *Itvsh) restoreCookies() {
 }
 
 // relogin 在业务请求因鉴权失效失败时恢复会话，全程无用户介入。
-// 顺序与上游一致：先用会话 cookie 重取用户信息（不带密码），
-// 不行再用已存密码重新登录。
+// 只走账密重登一条路：cookie 重取用户信息那条捷径已移除 ——
+// 它本身就依赖会话 cookie 有效，而会话失效时它必然先失败一次，
+// 白白多打一个请求、多产生一行 WARN，纯属开销。
+//
+// 注意：登录后必须补 regraftCookies + saveCookies，理由与 Init 中同名步骤完全一致 ——
+// 登录响应会把 forwardUrl 带回来，新下发的 cookie 只有按它的域名作用域重新回填并落库，
+// 下次启动 persistURLs 才认得出这些 cookie，否则会被丢在错误的 host 下。
 func (d *Itvsh) relogin(ctx context.Context) error {
 	d.authMu.Lock()
 	defer d.authMu.Unlock()
 
-	if d.hasCookies() {
-		if err := d.refreshSession(ctx); err == nil {
-			return nil
-		} else {
-			utils.Log.Warnf("[zhi] refresh session with cookies failed: %v", err)
-		}
-	}
 	if d.Mobile == "" || d.Password == "" {
 		return errs.EmptyPassword
 	}
@@ -310,6 +314,9 @@ func (d *Itvsh) relogin(ctx context.Context) error {
 	if err := d.refreshUserInfo(ctx); err != nil {
 		return err
 	}
+	d.regraftCookies()
+	d.saveCookies()
+	// 无论 cookie 有没有变化都要落库：AccessToken 已经换了，而它同样持久化在 Addition 里。
 	op.MustSaveDriverStorage(d)
 	return nil
 }
@@ -330,17 +337,6 @@ func (d *Itvsh) withRelogin(ctx context.Context, fn func() error) error {
 		return err
 	}
 	return fn()
-}
-
-// refreshSession 凭已存的会话 cookie 重新拉取用户信息。
-// token 失效（1009）时上游就是这么恢复的：不带密码，只靠 cookie。
-// 成功即说明会话仍然有效，调用方可以据此重试原请求。
-func (d *Itvsh) refreshSession(ctx context.Context) error {
-	if err := d.refreshUserInfo(ctx); err != nil {
-		return err
-	}
-	op.MustSaveDriverStorage(d)
-	return nil
 }
 
 // rawPost 发一个带认证头的 JSON POST，返回通用信封（data 未解析）
