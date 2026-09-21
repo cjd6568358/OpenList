@@ -13,7 +13,7 @@
 #
 # 需要调用方注入 GH_TOKEN。
 #
-# release 不存在或没有任何 7z 产物时：打 notice 并成功退出，不生成文件。
+# release 不存在或没有任何产物时：打 notice 并成功退出，不生成文件。
 
 set -euo pipefail
 
@@ -26,11 +26,15 @@ PROXIES="ghfast.top v6.gh-proxy.org hk.gh-proxy.org cdn.gh-proxy.org edgeone.gh-
 
 # release 可能不存在（例如所有 build job 都失败在创建 release 之前），
 # 此时 gh 会非零退出，用 || true 压掉以免 set -e 中断。
+#
+# 产物不再做 7z 打包，Release 上就是裸可执行文件，所以不过滤扩展名：
+# 凡是本 workflow 传上去的 asset 都是要列出的产物。仅排除万一出现的
+# 关联文件（源码包）——它由 GitHub 自动生成，不是本次构建产物。
 assets="$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null \
-  | grep '\.7z$' | sort || true)"
+  | grep -v -e '\.tar\.gz$' -e '\.zip$' | sort || true)"
 
 if [ -z "$assets" ]; then
-  echo "::notice::release $tag 没有 7z 产物，跳过生成代理链接 txt"
+  echo "::notice::release $tag 没有产物，跳过生成代理链接 txt"
   exit 0
 fi
 scope_desc="全部 $(printf '%s\n' "$assets" | wc -l | tr -d ' ') 个产物"
@@ -39,7 +43,7 @@ scope_desc="全部 $(printf '%s\n' "$assets" | wc -l | tr -d ' ') 个产物"
   echo "# OpenList CI 构建产物：代理加速下载地址"
   echo "# release : ${tag}  (${repo})"
   echo "# 范围    : ${scope_desc}"
-  echo "# 文件名含义：openlist_<target>_<frontend>_<compress>.7z"
+  echo "# 文件名含义：openlist_<target>_<frontend>_<compress>[.exe]"
   echo "# 下面按代理域名分组，每组列出的都是全部产物，取需要的那个即可。"
   echo
 

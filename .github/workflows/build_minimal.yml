@@ -6,27 +6,23 @@ name: Minimal Build
 # 与 build.yml 的区别：
 #   1. matrix 不同（这里用 include 逐条列举，方便注释掉不想要的目标）
 #   2. 新增两种非静态-链接的 linux 变体（见下）
-#   3. 新增 lite 前端变体
-#   4. 新增 UPX 压缩变体
-#   5. 新增 WebDAV 产物清单上传（只传 txt，不传 7z）
-#   6. 新增「汇总」job：等全部变体跑完后，生成一份按代理域名分组、
+#   3. 新增 lite 前端变体、UPX 压缩变体
+#   4. 新增「汇总」job：等全部变体跑完后，生成一份按代理域名分组、
 #      列出该 Release 全部产物的 proxy_<sha>.txt 并上传到 WebDAV。
 #      这是全局唯一产生下载清单、且唯一写 WebDAV 的地方（见下）。
 #
 # 产物分发渠道（两条，互不影响）：
-#   GitHub Release  7z 产物本体。proxy_<sha>.txt 里的加速地址指向这里，
-#                   所以它是下载链路的最终来源，WebDAV 只是清单托管处。
+#   GitHub Release  可执行文件本体，见 build job 的 "Publish to GitHub Release"。
+#                   proxy_<sha>.txt 里的加速地址指向这里，所以它是下载链路的
+#                   最终来源，WebDAV 只是清单托管处。
 #   WebDAV          只传一份 proxy_<sha>.txt（下载地址清单）。
-#                   7z 不传 —— 几十 MB × 25 个变体是重复占用，而 txt 里的
-#                   加速地址指向 Release、不经过 WebDAV，代理下载已够用。
-#                   想恢复 7z 镜像：见 summarize 里 "Upload to WebDAV" 的注释。
+#                   产物本体不传 —— 几十 MB × 25 个变体是重复占用，而 txt
+#                   里的加速地址指向 Release、不经过 WebDAV，代理下载已够用。
+#                   想恢复产物镜像：见 summarize 里 "Upload to WebDAV" 的注释。
 #
-# 下载地址清单只在一个地方产生（WebDAV <WEBDAV_DIR>/，无 commit 子目录）：
-#   summarize 生成 proxy_<sha>.txt，列出该 Release 里成功的全部产物，
-#   上传后把它作为正文发一封邮件。
-#   commit 体现在文件名里而不是目录层 —— 每个 commit 只有这一个文件，
-#   为它单开一层目录只是徒增嵌套。
-#   build job 完全不经手 WebDAV：它只把 7z 交给 GitHub Release。
+# 下载地址清单：summarize 生成 proxy_<sha>.txt，列出该 Release 里成功的全部
+#   产物，上传到 WebDAV <WEBDAV_DIR>/（无 commit 子目录，commit 在文件名里），
+#   再把它作为正文发一封邮件。build job 不经手 WebDAV，只把产物交给 Release。
 #
 #   ⚠ 代价：下载地址要等 build 全部跑完才可用。build 失败/被 cancel 时
 #   summarize 不跑（它靠 always() 只在 build 结束后启动），此时 WebDAV 上
@@ -54,10 +50,9 @@ name: Minimal Build
 #   lite 前端对该体积的影响远大于链接方式，想瘦身优先看 lite 那条。
 #
 # UPX 说明：只对 linux 生效（windows 不做，原因见 "Compress with UPX" 步骤注释）。
-#   当前 matrix 对 musl / glibc / nocgo 三种链接方式都开了 UPX。
-#   但压缩率差别很大：纯 Go(nocgo) 产物收益明显，musl/glibc 产物收益很小
-#   —— 体积大头是**已经压缩过**的前端 dist，再压一遍榨不出多少。
-#   所以 UPX 让变体数翻倍，换来的体积收益有限；真要瘦身请看 lite 前端。
+#   收益差别很大：纯 Go(nocgo) 产物明显，musl/glibc 产物很小 —— 体积大头是
+#   **已经压缩过**的前端 dist，再压一遍榨不出多少。所以 UPX 让变体数翻倍，
+#   换来的体积收益有限；真要瘦身请看 lite 前端。
 #
 # 不需要的目标/变体，直接把 include 里对应那两行注释掉即可。
 
@@ -343,8 +338,8 @@ jobs:
           esac
           ls -la build/
 
-      # 产物不走 artifact 上传：走 GitHub Release(7z) 本体，
-      # 外加 WebDAV 一条清单渠道（不传 7z），
+      # 产物不走 artifact 上传：走 GitHub Release 本体，
+      # 外加 WebDAV 一条清单渠道（不传产物本体），
       # 顺带省下每次 run 约 0.9~1.3GB 的 artifact 占用。
       # 下方保留原步骤备查，需要临时走 artifact 调试时取消注释即可。
       #
@@ -357,7 +352,7 @@ jobs:
 
       - name: Stage artifact with descriptive name
         # 产物编译出来统一叫 openlist[.exe]，变体信息只存在于目录/文件名里。
-        # 后续 7z 与 Release asset 的命名都从这里来，
+        # 后续 Release asset 的命名都从这里来，
         # 不带变体信息的话 25 个变体会同名互相覆盖。
         env:
           TARGET: ${{ matrix.target }}
@@ -369,57 +364,12 @@ jobs:
             *)         mv build/openlist     "build/${name}";     echo "::notice::staged build/${name}" ;;
           esac
 
-      - name: Compress to 7z
-        # -mx=9 即 7-Zip 的 Ultra 等级（最高）。
-        # 注意归档内只放裸文件名：若传 "build/xxx" 给 7z，包内路径会带上
-        # build/ 前缀，解压出来多一层目录，所以先 cd 进 build 再压。
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -e
-
-          # p7zip-full 提供 7z；较新的 Ubuntu 改用 7zip 包（提供 7zz）。
-          if ! command -v 7z >/dev/null 2>&1; then
-            sudo apt-get update -qq || true
-            sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip || true
-          fi
-          # 7zz 是 7zip 包的二进制名，建个别名让后面统一用 7z。
-          if ! command -v 7z >/dev/null 2>&1 && command -v 7zz >/dev/null 2>&1; then
-            sudo ln -sf "$(command -v 7zz)" /usr/local/bin/7z
-          fi
-          command -v 7z >/dev/null 2>&1 || { echo "::error::7z 不可用"; exit 1; }
-          7z | head -3
-
-          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
-          # 文件名由上一步决定，直接按名字取，不用 ls 通配去猜：
-          # 通配会按字母序静默挑中任意一个 openlist* 文件，挑错不报错。
-          case "$TARGET" in
-            *windows*) binname="${name}.exe" ;;
-            *)         binname="${name}" ;;
-          esac
-          [ -f "build/${binname}" ] || {
-            echo "::error::找不到待压缩产物 build/${binname}"
-            ls -la build/ || true
-            exit 1
-          }
-
-          ( cd build && 7z a -mx=9 "${name}.7z" "${binname}" )
-
-          # 裸二进制不再需要：本 job 只传 7z，Release 也只收 7z。
-          # 删掉可避免后续 build/* 通配符把它一起带走。
-          rm -f "build/${binname}"
-
-          before=$(stat -c %s "build/${name}.7z")
-          echo "::notice::7z(${name}) = ${before} bytes"
-
       - name: Publish to GitHub Release
         # 产出永久公开直链，形如：
         #   https://github.com/cjd6568358/OpenList/releases/download/ci-<sha>/<asset>
-        # 与 WebDAV 那步完全独立：这边只负责 7z，WebDAV 只放清单文本。
-        #
-        # 与代理清单的先后关系：txt 里拼的就是这里的 asset URL。
-        # 但生成 txt 已挪到 summarize job，靠 needs: build 保证本 job 全跑完
-        # 才开始 —— 所以这里不需要关心顺序，只要不把上传挪到 job 外面即可。
+        # 与 WebDAV 那步完全独立：这边只负责上传产物本体，WebDAV 只放清单文本。
+        # 与代理清单的先后关系：txt 里拼的就是这里的 asset URL，但生成 txt 在
+        # summarize job 里，靠 needs: build 保证本 job 全跑完才开始。
         #
         # tag 用 ci-<commit>：每个 commit 一个 Release，永久归档、互不覆盖。
         # 因为 tag 里已含 commit，asset 名就不再重复带 commit。
@@ -431,6 +381,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.short-sha.outputs.sha }}
+          TARGET: ${{ matrix.target }}
           MATRIX_DESC: ${{ matrix.target }} / ${{ matrix.frontend }} / ${{ matrix.compress }}
         run: |
           set -e
@@ -446,7 +397,7 @@ jobs:
                  --title "CI build ${SHA}" \
                  --prerelease \
                  --target "${GITHUB_SHA}" \
-                 --notes "$(printf '由 build_minimal.yml 自动构建。\n\n- commit: %s\n- 分支: %s\n- 变体: %s\n- 触发: %s\n\nasset 为 7z 压缩包，内含对应的可执行文件。\n各文件名对应不同链接方式/前端/压缩组合。\nCI 产物未经发布流程验证，请自行核对。' \
+                 --notes "$(printf '由 build_minimal.yml 自动构建。\n\n- commit: %s\n- 分支: %s\n- 变体: %s\n- 触发: %s\n\nasset 为可直接运行的可执行文件（未压缩）。\n各文件名对应不同链接方式/前端/压缩组合。\nCI 产物未经发布流程验证，请自行核对。' \
                    "${GITHUB_SHA}" "${GITHUB_REF_NAME}" "${MATRIX_DESC}" "${GITHUB_EVENT_NAME}")"; then
               # 竞态：别的 job 抢先创建了。确认它确实存在即可继续。
               if gh release view "$tag" >/dev/null 2>&1; then
@@ -458,9 +409,23 @@ jobs:
             fi
           fi
 
+          # 上传上一步暂存的裸二进制。显式带上 matrix.frontend / compress
+          # 拼出确定的名字，不用通配符：build/ 里可能有别的东西，通配会
+          # 静默挑错文件。
+          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
+          case "$TARGET" in
+            *windows*) asset="build/${name}.exe" ;;
+            *)         asset="build/${name}" ;;
+          esac
+          [ -f "$asset" ] || {
+            echo "::error::找不到待上传产物 ${asset}"
+            ls -la build/ || true
+            exit 1
+          }
+
           # --clobber：同 commit 重跑时覆盖同名 asset，保证幂等。
-          gh release upload "$tag" build/*.7z --clobber
-          echo "::notice::release $tag 已更新"
+          gh release upload "$tag" "$asset" --clobber
+          echo "::notice::release $tag 已更新：${asset}"
 
   summarize:
     # 等 build 全部跑完（无论成败）再执行。
@@ -472,12 +437,7 @@ jobs:
     #       (2) 上传到 WebDAV
     #       (3) 把它作为正文发一封邮件
     # 顺序是「先上传、再发信」：邮件说出「已经在 WebDAV 上」时，它确实在。
-    #
-    # 这是全局唯一一处 WebDAV 上传，也是唯一产生下载清单的地方 ——
-    #   build job 不生成 txt、不上传 WebDAV，只把 7z 交给 GitHub Release。
-    #   (a) WebDAV 写入从 25 个并发点收敛成 1 个，不再有并发建同一串目录的
-    #   竞态，也就没有了反代限流下的 502；(b) 目录层取消，commit 挪进文件名。
-    # 代价：下载地址不再「编译完即可用」，要等 build 全部结束。
+    # 详见文件头「下载地址清单」一段。
     needs: build
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -505,19 +465,11 @@ jobs:
           bash .github/scripts/gen-proxy-txt.sh "ci-${SHA}" "${REPO}" "proxy_${SHA}.txt"
 
       - name: Upload to WebDAV
-        # 全局唯一一处 WebDAV 上传，只传一份 proxy_<sha>.txt。
+        # 全局唯一一处 WebDAV 上传，只传一份 proxy_<sha>.txt。目录层级、建目录
+        # 方式和 WEBDAV_DIR 的约束详见文件头「下载地址清单」一段。
         #
-        # 目录层级已取消（不再有 <commit>/ 这一层）：WEBDAV_REMOTE_DIR 直接
-        #   是 WEBDAV_DIR，commit 体现在文件名里。每个 commit 只有这一个文件，
-        #   为它单开一层目录只是徒增层级。
-        #
-        # 建目录由 upload-webdav.sh 自己做（只建叶子目录，见脚本注释）：
-        #   整条链上只有这一个上传方，不存在并发建同一串目录的竞态，
-        #   所以不需要单独的前置 job。
-        #
-        # WEBDAV_DIR 必须配：布局取消 <commit>/ 这一层后，它成了唯一的
-        #   目录约束。留空等于把文件倒进 WebDAV 根目录 —— 脚本对空
-        #   remote_dir 的行为正是「传到根目录」，所以在这里挡住。
+        # WEBDAV_DIR 必须配：留空等于把文件倒进 WebDAV 根目录（脚本对空
+        #   remote_dir 的行为正是「传到根目录」），所以在这里挡住。
         env:
           WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
           WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
@@ -533,7 +485,7 @@ jobs:
             fi
           fi
           if [ ! -f "proxy_${SHA}.txt" ]; then
-            echo "::notice::未生成 proxy_${SHA}.txt（release 无 7z 产物），跳过上传"
+            echo "::notice::未生成 proxy_${SHA}.txt（release 无产物），跳过上传"
             exit 0
           fi
           bash .github/scripts/upload-webdav.sh "proxy_${SHA}.txt"
