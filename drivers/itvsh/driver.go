@@ -42,6 +42,13 @@ type Itvsh struct {
 
 	// authMu 串行化「重新登录 / 刷新会话」，避免并发请求同时触发多轮登录。
 	authMu sync.Mutex
+
+	// sessionToken 是账号密码登录后服务端下发的 token，只存内存。
+	// 必须与 AccessToken（用户填的配置，带 json tag、会落库）分开：
+	// 登录产物一旦被写进 Addition，保存配置后 token 栏就会被回显，
+	// 且下次启动会拿它去请求，绕开「失效即账密重登」的逻辑。
+	// 无 json tag，不参与 Addition 编解码，天然不会被持久化。
+	sessionToken string
 }
 
 func (d *Itvsh) Config() driver.Config {
@@ -111,7 +118,8 @@ func (d *Itvsh) Init(ctx context.Context) error {
 			}
 			utils.Log.Warnf("[zhi] login failed, fallback to persisted cookies: %v", err)
 		}
-		op.MustSaveDriverStorage(d)
+		// 登录得到的 token 只在内存里（见 Itvsh.sessionToken），此处不落库；
+		// 需要持久化的只有 cookie，由下面的 saveCookies 负责。
 	}
 	if err := d.refreshUserInfo(ctx); err != nil {
 		return err

@@ -23,8 +23,7 @@ type Addition struct {
 
 	// Cookies 持久化上游下发的会话 cookie（JSON 数组）。
 	// 同上，不带 json tag，不进表单。
-	// 登录态实际靠 cookie 维持（token 失效时可凭 cookie 不带密码重取用户信息），
-	// 只放在内存 jar 里一重启就丢，会导致反复要求用户重新登录。
+	// 只放在内存 jar 里一重启就丢，会导致每次启动都要重新登录，故随配置落库。
 	Cookies string
 }
 

@@ -175,13 +175,22 @@ func parseTime(s string) time.Time {
 
 // ==================== 认证相关 ====================
 
+// authToken 返回当前生效的 token：用户手填的 AccessToken 优先
+// （这正是「跳过账密登录」的语义），否则用账密登录得到的 sessionToken。
+func (d *Itvsh) authToken() string {
+	if d.AccessToken != "" {
+		return d.AccessToken
+	}
+	return d.sessionToken
+}
+
 // authHeaders 返回所有请求都要带的头。
 // 只保留上游必需的 X-NAS-* 与一个语言标记；其余一律从简 ——
 // 上游 WAF 对多余/伪装的头部很敏感，见 Init 里的说明。
 func (d *Itvsh) authHeaders() map[string]string {
 	return map[string]string{
 		"X-NAS-CLIENTTYPE": "60",
-		"X-NAS-SDKTOKEN":   d.AccessToken,
+		"X-NAS-SDKTOKEN":   d.authToken(),
 		"Accept-Language":  "zh-cn",
 	}
 }
@@ -301,6 +310,7 @@ func (d *Itvsh) restoreCookies() {
 // 注意：登录后必须补 regraftCookies + saveCookies，理由与 Init 中同名步骤完全一致 ——
 // 登录响应会把 forwardUrl 带回来，新下发的 cookie 只有按它的域名作用域重新回填并落库，
 // 下次启动 persistURLs 才认得出这些 cookie，否则会被丢在错误的 host 下。
+// 登录得到的 token 不落库（见 Itvsh.sessionToken），这里落库的是 cookie 与 forwardUrl。
 func (d *Itvsh) relogin(ctx context.Context) error {
 	d.authMu.Lock()
 	defer d.authMu.Unlock()
@@ -315,8 +325,9 @@ func (d *Itvsh) relogin(ctx context.Context) error {
 		return err
 	}
 	d.regraftCookies()
+	// 无论 cookie 有没有变化都要落库：forwardUrl 可能刚被登录响应更新，
+	// 而它同样持久化在 Addition 里。
 	d.saveCookies()
-	// 无论 cookie 有没有变化都要落库：AccessToken 已经换了，而它同样持久化在 Addition 里。
 	op.MustSaveDriverStorage(d)
 	return nil
 }
@@ -413,7 +424,8 @@ func (d *Itvsh) login(ctx context.Context) error {
 	if data.AccessToken == "" {
 		return fmt.Errorf("login failed: access_token is empty")
 	}
-	d.AccessToken = data.AccessToken
+	// 只写内存，不碰 AccessToken（用户填的配置字段），见 Itvsh.sessionToken
+	d.sessionToken = data.AccessToken
 	if data.ForwardUrl != "" {
 		d.Addition.ForwardUrl = data.ForwardUrl
 	}
