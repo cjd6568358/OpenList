@@ -3,6 +3,7 @@ package itvsh
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -50,6 +51,11 @@ var authFailureMarkers = []string{
 	"登录已过期",
 	"未登录",
 }
+
+// errAccessTokenRefreshed 表示 token 由用户手工配置、驱动无法续期。
+// 它不是上游错误，而是驱动对「配置形态下鉴权失效」的明确表态，
+// 最终会替换掉原始的上游错误返回给用户，用于提示手动更新 token。
+var errAccessTokenRefreshed = errors.New("配置的 access token 已失效，且无法自动刷新，请手动更新")
 
 // isAuthFailure 判断错误是否属于「会话失效、可自动恢复」
 func isAuthFailure(err error) bool {
@@ -311,10 +317,17 @@ func (d *Itvsh) restoreCookies() {
 // 登录响应会把 forwardUrl 带回来，新下发的 cookie 只有按它的域名作用域重新回填并落库，
 // 下次启动 persistURLs 才认得出这些 cookie，否则会被丢在错误的 host 下。
 // 登录得到的 token 不落库（见 Itvsh.sessionToken），这里落库的是 cookie 与 forwardUrl。
+// token 来自配置（AccessToken 非空）时不做任何恢复：那种形态下 token 是用户
+// 手工提供的，驱动无从续期（refresh_token 未被使用），而 authToken() 又始终
+// 优先返回它 —— 就算在这里登录成功，换来的 sessionToken 也永不会被发出。
+// 直接报错让用户手动更新 token，不去白白验证一遍账密、多打几轮无果的请求。
 func (d *Itvsh) relogin(ctx context.Context) error {
 	d.authMu.Lock()
 	defer d.authMu.Unlock()
 
+	if d.AccessToken != "" {
+		return errAccessTokenRefreshed
+	}
 	if d.Mobile == "" || d.Password == "" {
 		return errs.EmptyPassword
 	}
@@ -343,8 +356,13 @@ func (d *Itvsh) withRelogin(ctx context.Context, fn func() error) error {
 	}
 	utils.Log.Warnf("[zhi] auth failed, restoring session: %v", err)
 	if rerr := d.relogin(ctx); rerr != nil {
-		// 恢复失败时返回原始错误，更有诊断价值
 		utils.Log.Errorf("[zhi] restore session failed: %v", rerr)
+		// token 是手工配置的，驱动续不了，只能让用户自己换 —— 这条比原始的上游
+		// 错误（"code 1010, msg: token expired"）更能说明该做什么，故替换掉。
+		if errors.Is(rerr, errAccessTokenRefreshed) {
+			return rerr
+		}
+		// 其余恢复失败仍返回原始错误，更有诊断价值
 		return err
 	}
 	return fn()
@@ -452,15 +470,24 @@ func (d *Itvsh) refreshUserInfo(ctx context.Context) error {
 	return nil
 }
 
-// volumeInfo 取空间信息
+// volumeInfo 取空间信息。与业务接口同样包一层 withRelogin：
+// 它走 postEnvelope 而非 nasProxy，不包的话 token 失效时 GetDetails 会一直报错，
+// 且不像 list/link/upload 那样能自愈。配置 token 形态下则由 withRelogin 返回
+// errAccessTokenRefreshed，提示用户更新 token。
 func (d *Itvsh) volumeInfo(ctx context.Context) (*volumeInfo, error) {
-	resp, err := d.postEnvelope(ctx, apiBase+"/nas/volume/info", base.Json{})
+	var info volumeInfo
+	err := d.withRelogin(ctx, func() error {
+		resp, err := d.postEnvelope(ctx, apiBase+"/nas/volume/info", base.Json{})
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(resp.Data, &info); err != nil {
+			return fmt.Errorf("parse volume info failed: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	var info volumeInfo
-	if err := json.Unmarshal(resp.Data, &info); err != nil {
-		return nil, fmt.Errorf("parse volume info failed: %w", err)
 	}
 	return &info, nil
 }

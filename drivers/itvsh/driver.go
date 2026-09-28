@@ -122,6 +122,11 @@ func (d *Itvsh) Init(ctx context.Context) error {
 		// 需要持久化的只有 cookie，由下面的 saveCookies 负责。
 	}
 	if err := d.refreshUserInfo(ctx); err != nil {
+		// token 来自配置时驱动无法续期，只能让用户自己换。仅当确属鉴权失效
+		// 才归因到 token，免得把网络/WAF 问题误导成「token 过期」。
+		if d.AccessToken != "" && isAuthFailure(err) {
+			return errAccessTokenRefreshed
+		}
 		return err
 	}
 	// 到这里 forwardUrl 已就绪，把 cookie 按正确的域名作用域重新回填并落库，
