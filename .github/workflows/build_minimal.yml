@@ -128,10 +128,10 @@ jobs:
           #   compress: none
 
           # ---- Linux，纯 Go 零依赖 CGO_ENABLED=0 ----
-          # - target: linux-amd64-nocgo
-          #   compress: none
-          # - target: linux-arm64-nocgo
-          #   compress: none
+          - target: linux-amd64-nocgo
+            compress: none
+          - target: linux-arm64-nocgo
+            compress: none
 
           # ---- UPX 压缩变体（仅 linux）----
           # 想让变体数减少，把不需要的行注释掉即可。
@@ -143,10 +143,10 @@ jobs:
           #   compress: upx
           # - target: linux-arm64
           #   compress: upx
-          - target: linux-amd64-nocgo
-            compress: upx
-          - target: linux-arm64-nocgo
-            compress: upx
+          # - target: linux-amd64-nocgo
+          #   compress: upx
+          # - target: linux-arm64-nocgo
+          #   compress: upx
 
     name: Build ${{ matrix.target }} (${{ matrix.compress }})
     runs-on: ubuntu-latest
