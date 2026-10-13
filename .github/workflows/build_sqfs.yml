@@ -1,0 +1,1270 @@
+name: SquashFS Build (CDN + trimmed drivers)
+
+# ============================================================================
+#  OpenList 精简构建 · 方法论文档
+# ============================================================================
+#
+#  自包含：整个精简逻辑（约 470 行 Python）就内联在下面 "Generate build
+#  overlay" 那一步里，没有外部脚本。改驱动时不需要重新分析项目结构。
+#
+#  §0  想改驱动 / 改精简项时只看这一节
+#  ---------------------------------------------------------------------------
+#  改 workflow_dispatch 的输入即可。脚本会自动处理所有**连带关系**：
+#
+#    (a) drivers/all.go 的空导入列表    —— 你勾什么就留什么
+#    (b) core 里为类型断言硬 import 的驱动 —— 见 §4，脚本按勾选自动决定
+#    (c) 只服务于某个驱动的第三方库        —— 见 §5，脚本按勾选自动决定
+#
+#  默认已经打开的四项精简：
+#    drivers       14 个常用驱动（不含 s3 / thunderx 等 AWS 系）
+#    strip_offline true  整个离线下载功能
+#    strip_ffmpeg  true  ffmpeg（视频缩略图）
+#    db_backends   sqlite
+#
+#  另有可选的两项（默认关）：
+#    strip_protocols  none  服务端协议裁剪，可填 s3 / mcp（见 §12）
+#    search_backends  all   检索引擎裁剪，可填 db,db_non_full_text
+#
+#  改完驱动后唯一要自查的：**数据库里已有的存储记录**。被裁掉的驱动若还在
+#  storage 表里，启动会报 `no driver named: xxx`，需先删掉那条存储。
+#
+#  §1  为什么"去掉前端还有 80+ MB"
+#  ---------------------------------------------------------------------------
+#  不是你的代码大。62.81 MiB 的产物里，**Go 运行时元数据占 54.9%**，自研代码
+#  只占 2.3%。其中 `.gopclntab`（栈回溯/行号表）与 `.text` 几乎 1:1 等大，
+#  且 `-w -s` **剥不掉**——GC 扫栈和 panic traceback 都依赖它。
+#  实测基线（hello-world，同 Go 版本）：gopclntab/text = 1.05。这是 Go 1.27
+#  的普遍特性，不是本项目问题。
+#
+#  §2  体积构成（arm64 / 16 驱动 / CDN / 剥离离线下载 / -w -s，实测 62.81 MiB）
+#  ---------------------------------------------------------------------------
+#    .text         26.89 MB  40.8%   机器码，可归因
+#    .gopclntab    25.83 MB  39.2%   栈回溯表，不可剥离
+#    .go.type       5.94 MB   9.0%   类型元数据，不可剥离
+#    .rodata        3.52 MB   5.3%   只读数据 + 字符串池
+#    .noptrdata     2.86 MB   4.3%
+#    .data          0.61 MB   0.9%
+#
+#  按来源拆：Go 元数据 34.51 MiB(54.9%) / 第三方库 24.57 MiB(39.1%) /
+#            标准库 2.13 MiB(3.4%) / 自研 1.44 MiB(2.3%) / 头部对齐 0.16 MiB
+#
+#  复现方法见 §9。
+#
+#  §3  裁剪的放大倍率 —— 方法论核心
+#  ---------------------------------------------------------------------------
+#  **删掉 1 MB 代码，文件大约小 2.41 MB**（text 1.0 + pclntab 0.94 + types 0.39
+#  + 其它 0.08）。这是实测：87 驱动 → 16 驱动，.text −5.61 MB，.gopclntab
+#  −5.26 MB，文件共 −12.91 MiB。
+#
+#  但倍率**不是常数**。删 AWS SDK 时 .text 只降 2.42 MB，.gopclntab 降了
+#  4.21 MB（1.74 倍），整体倍率 3.35 倍。原因是 pclntab 有**每函数固定开销**
+#  （functab 8B + _func ~44B + pcfile/pcln 变长表），所以「大量小函数」的依赖
+#  （生成式 API 那种）代价被显著放大。
+#
+#  ⇒ 判断一个依赖值不值得删，**看它的函数数量，不能只看代码体积**。
+#
+#  §4  core 硬编码耦合清单 —— 改驱动时必看
+#  ---------------------------------------------------------------------------
+#  这些文件为了**类型断言**硬 import 了具体驱动，它们永远在依赖图里。
+#  只改 drivers/all.go 是裁不掉的。
+#
+#    文件                                        硬编码的驱动                        剥离条件
+#    ----------------------------------------    --------------------------------    ------------------
+#    internal/offline_download/tool/add.go       115 115_open 123 123_open          strip_offline=true
+#                                                guangyapan pikpak thunder
+#                                                thunder_browser thunderx
+#    internal/offline_download/tool/transfer.go  189pc (天翼云秒传)                   同上
+#    server/handles/offline_download.go          上述 9 个驱动 (各 Set* handler)      同上
+#    server/handles/torrent.go                   189pc (torrent CAS 秒传)            未勾选 189pc
+#    internal/search/util.go                     openlist (跨实例索引)                未勾选 openlist
+#    drivers/local/util.go                       ffmpeg-go (视频缩略图)              strip_ffmpeg=true
+#    internal/net/request.go                     aws-sdk-go (仅为 awsutil.Copy)      未勾选任何 AWS 系驱动
+#    internal/bootstrap/db.go                    mysql / postgres (gorm 驱动)        db_backends 未包含
+#    internal/search/import.go                   bleve / meilisearch                 search_backends 未包含
+#
+#  **AWS 系驱动**（勾了任意一个，aws-sdk-go 就必然在二进制里）：
+#      123  halalcloud  mediatrack  s3  teambition  thunder  thunder_browser  thunderx
+#
+#  §5  第三方库的连带关系（为什么一个小功能会拖进几 MB）
+#  ---------------------------------------------------------------------------
+#    gin/binding  → github.com/ugorji/go/codec  (2.93 MB，最大的单个第三方包)
+#                   只为 msgpack 绑定。Gin 自带 `//go:build nomsgpack` 开关，
+#                   OpenList 不用 msgpack ⇒ 构建时固定加 `-tags=nomsgpack`。
+#    drivers/local → github.com/u2takey/ffmpeg-go
+#                   ffmpeg-go 无条件 import aws-sdk-go（3 个 import），只为
+#                   `Output("s3://...")`，OpenList 走不到。
+#                   两种处理方式：
+#                     strip_ffmpeg=true  → 直接从 util.go 摘掉 ffmpeg，整个
+#                                          ffmpeg-go 不进二进制。**推荐**。
+#                     strip_ffmpeg=false → 保留视频缩略图，此时脚本会额外把
+#                                          ffmpeg-go 复制出来打补丁、走
+#                                          -modfile + replace（因为 -overlay
+#                                          改不了 GOMODCACHE）。
+#    internal/net/request.go → aws-sdk-go/aws/awsutil
+#                   仅 2 处 awsutil.Copy 深拷贝 HttpRequestParams{URL,Range,
+#                   HeaderRef,Size}；拷贝后只改 Range，浅拷贝语义等价。
+#    gorm 驱动     → sqlite(glebarez 纯 Go) / mysql / postgres(pgx)
+#    gorm 驱动     → mongo / bleve / meilisearch（见 internal/search）
+#
+#  §6  输入速查表
+#  ---------------------------------------------------------------------------
+#    drivers         保留的存储驱动（逗号/空格分隔，或 all = 全量 87 个）
+#                    可用名单：在仓库根跑
+#                      python3 build/gen_overlay.py --list-drivers
+#                    留空 = all
+#    strip_offline   true(默认) 移除整个离线下载功能 / false 保留
+#    strip_ffmpeg    true(默认) 移除 ffmpeg 与视频缩略图 / false 保留
+#    db_backends     保留的数据库后端，默认 sqlite
+#                    （已知：sqlite / mysql / postgres；多个用逗号，all = 全留）
+#    search_backends 保留的检索引擎，默认 all
+#                    （已知：bleve / meilisearch；db、db_non_full_text 恒留）
+#    strip_protocols 要剥掉的服务端协议，默认 none
+#                    （已知：s3 / mcp；ftp 不支持，原因见 §12）
+#    arch            linux-arm64(默认) / linux-armv7 / linux-amd64
+#    compress        none(默认) / upx —— 光猫场景请保持 none，见 §7
+#    cdn             前端 CDN 基址（只写进产物说明，运行时仍需配置）
+#
+#  §7  设备侧约束（中兴 F4610U，选错白跑）
+#  ---------------------------------------------------------------------------
+#    - 挂载点 /opt/sq/openlist，backing file /opt/armbian/bin/openlist/openlist.sqfs
+#      挂载：mount -t squashfs -o loop,ro <img> /opt/sq/openlist
+#    - **镜像内可执行文件必须叫 openlist**（openlist_start.sh 硬编码该路径）
+#      ⇒ mksquashfs 的源目录必须是 stage/openlist 本身，传父目录会让镜像里多
+#        一层 openlist/，挂载后路径变成 .../openlist/openlist。现役镜像
+#        inodes=2 即为此（根目录 + 该文件）。
+#    - **镜像内 openlist 必须可执行且属主 root**：openlist_start.sh 启动前有
+#      `[ ! -x "$APP" ]` 检查，不可执行直接拒绝启动。所以打包时
+#      `chmod 755` 源文件 + `mksquashfs -all-root`，并在打包后断言
+#      `-rwxr-xr-x root/root`，模式不对就让构建失败。
+#      （CI 里 mksquashfs 以 runner/uid 1001 运行，不加 -all-root 镜像里就是
+#        1001:1001，与设备现役镜像不一致。）
+#    - **必须 -b 1M**：128K 块会大 3.4 MiB
+#    - **不要加 -Xbcj arm**：对 AArch64 无效
+#    - 内核 4.1.25 已实测支持 squashfs + xz + 1M 块
+#    - **默认不开 UPX**：光猫上 UPX 的 stub 把整个解压体放进**匿名**内存，
+#      无 swap 不可回收，1:1 扣减可用内存。设备侧 2026-10-09 起已全面停用，
+#      改为 squashfs 挂载 raw 二进制（file-backed，可丢弃）。
+#      详见 server 仓库 0806/BUILD-ENV.md §3.3 / f4610u/F4610U.md §5-19。
+#
+#  §8  已知坑
+#  ---------------------------------------------------------------------------
+#    - **`-tags=jsoniter` 是死开关**：项目里没有任何 `jsoniter` build tag，
+#      带与不带产物**逐字节相同**（实测 65,863,840 == 65,863,840）。本 workflow
+#      不再传它。build.sh 里那行也可以删。
+#    - **`-trimpath` 不能写进 LDFLAGS**。它是 go build 的参数，不是链接器的；
+#      混进去会让 `go tool link` 报 "flag provided but not defined: -trimpath"
+#      并打出 usage。LDFLAGS 里只放 -s -w -X。
+#    - **`go build -overlay` 不能替换 GOMODCACHE 下的文件**，会报
+#      "Files beneath GOMODCACHE must not be replaced"。改第三方模块必须走
+#      -modfile + replace（strip_ffmpeg=false 时脚本会自动处理）。
+#    - **必须先 `go mod download`**：补丁 ffmpeg-go 要靠 `go list -m -f {{.Dir}}`
+#      定位模块源码，模块缓存为空时无法工作。workflow 里有 "Warm module cache"。
+#    - **`-w -s` 剥不掉 .gopclntab**，别指望靠它减体积。
+#    - **strip_ffmpeg 会破坏一个单元测试**：drivers/local/pdf_thumb_test.go 里
+#      `{name: "video", fileName: "movie.mp4", want: true}` 期望视频可缩略图。
+#      `go build` 不受影响（测试文件不参与编译），但本地跑 `go test ./drivers/local`
+#      会失败。那是 overlay 生效的预期结果。
+#    - **运行时必须配 CDN**：Cdn=="" 时会去 fs.Sub(static,"assets") 直接 Fatal。
+#      这个二进制不能当通用版发出去。环境变量是 `OPENLIST_CDN=`（不是裸 CDN=）。
+#    - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回去读内嵌 index.html
+#      然后 Fatal。
+#    - **CDN 里别写 $version**：代码会把 $version 替换成 WebVersion 即 `rolling`，
+#      而 npm 上没有 rolling 这个 dist-tag。用 `@latest` 或写死版本号。
+#    - Go 版本必须 1.27.1：go.mod 要求 go 1.26.0 / toolchain go1.27.1。
+#      设备文档里「锁 go1.22.12 避 32MiB BSS 雷」的前提是 overcommit_memory=0；
+#      2026-10-09 实测已更正为 1，且现役 openlist 就是 go1.27.1 编的并正常运行。
+#      （那个 32 MiB 是 crypto/internal/fips140/drbg 的 ScratchBuffer[1<<25]，
+#        BSS 不占文件但首次用 crypto/rand 会真的提交约 32 MiB 物理内存。）
+#
+#  §9  怎么复现 §2 的体积分析
+#  ---------------------------------------------------------------------------
+#    1. 构建一份**带符号表**的同配置产物（不要加 -w -s）：
+#         go build -tags=nomsgpack -overlay=<overlay.json> -o /tmp/sym .
+#    2. ELF 段级结构：
+#         python3 build/_elfsec.py /tmp/sym
+#    3. 包/模块级归因：
+#         go tool nm -size /tmp/sym > /tmp/nm.txt
+#         go list -deps . > /tmp/deps.txt        # 必须在仓库根目录执行
+#         python3 build/_nmstat.py /tmp/nm.txt /tmp/deps.txt
+#    注意 `go tool nm -size` 的 size 字段是**十进制**，按十六进制解析会把总量
+#    放大 11 倍。这两个脚本在 build/ 下（该目录已被 .gitignore）。
+#    另外：**验证裁剪别用 `go version -m`** —— 它列的是 go.mod 模块图，不是
+#    实际链接的包。用 `go list -deps` 才是权威。
+#
+#  §10  实测瘦身阶梯（arm64 / CDN / -w -s / strip_offline）
+#  ---------------------------------------------------------------------------
+#    配置                                          裸二进制      sqfs[xz,-b 1M]
+#    ------------------------------------------    ----------    --------------
+#    基线（16 驱动 + -tags=jsoniter）               62.81 MiB      15.11 MiB
+#    + -tags=nomsgpack                              57.31 MiB      —
+#    + 去掉 aws-sdk-go（14 驱动，无 s3/thunderx）    49.50 MiB      —
+#    + db_backends=sqlite                           45.81 MiB      12.72 MiB
+#    + strip_ffmpeg=true                            45.56 MiB      —
+#
+#    合计 −17.25 MiB（−27.5%）。sqfs 约为裸二进制的 27.8%。
+#
+#  §11  相对 build_minimal.yml 还能怎么优化体积
+#  ---------------------------------------------------------------------------
+#    build_minimal.yml 是**通用多平台构建**，本 workflow 是**单一设备镜像**，
+#    因此可以放弃通用性换体积。按性价比排序：
+#
+#    1. 前端走 CDN（本 workflow 已做）—— 省最多，前端 dist 原本 ~55 MB 被
+#       //go:embed 吸进二进制。注意 CDN 版**必须**运行时配 cdn，且 WebVersion
+#       必须是 rolling。
+#    2. `-tags=nomsgpack`（已做）—— 省 5.50 MiB，摘掉 gin 的 msgpack 绑定
+#       连带 ugorji/go/codec 2.93 MB。
+#    3. 裁驱动（已做）—— 87→14 省 12.91 MiB。倍率 2.41x，见 §3。
+#    4. 去掉 aws-sdk-go（已做）—— 省 7.69 MiB。倍率 3.35x（函数多）。
+#       需要同时摘掉 request.go 的 awsutil 与 ffmpeg-go 的 3 个 import。
+#    5. db 只留 sqlite（已做）—— 省 3.69 MiB（mysql + pgx）。
+#    6. strip_offline（已做）—— 去掉整个离线下载功能与其 9 个硬编码驱动。
+#    7. strip_ffmpeg（已做）—— 只省 0.13 MiB（因为 aws-sdk-go 已在第 4 步
+#       去掉）。**真正的价值是消掉了 -modfile 模块补丁这一整块复杂度**。
+#    8. search_backends=db,db_non_full_text —— 去掉 bleve（68 个包）与
+#       meilisearch，省约 1.7 MiB。代价是失去全文检索。
+#    9. strip_protocols=s3,mcp —— 剥掉 S3 与 MCP 服务端协议，省 512 KiB
+#       裸二进制 / 约 125 KiB（xz 后）。**性价比最低的一项**（约占镜像 1%），
+#       见 §12；只想要"只保留 sftp"的语义用配置关掉就行，不必重新构建。
+#   10. CGO_ENABLED=0 纯 Go —— 已隐含（sqlite 走 glebarez 纯 Go 驱动），
+#       无 glibc 版本要求，体积通常还比 musl 版小。
+#   11. UPX —— **光猫上不要用**，见 §7。体积收益也要打折，因为前端/数据段
+#       已经压过。
+#
+#    想再往下压，只剩两条路：换更小的 Go 运行时（比如 -gcflags 调优不现实）、
+#    或者把部分驱动改成运行时插件（OpenList 无插件机制，需大改）。
+#
+#  §12  服务端协议裁剪（strip_protocols）
+#  ---------------------------------------------------------------------------
+#    OpenList 的四种服务端协议各有一个顶层文件 + 一个子包：
+#
+#      协议    顶层文件          子包            拉进来的第三方库
+#      S3      server/s3.go     server/s3/      gofakes3、ncw/swift/v2
+#      MCP     server/mcp.go    server/mcp/     （无，只用 gin + internal）
+#      FTP     server/ftp.go    ——              fclairamb/ftpserverlib
+#      SFTP    server/sftp.go   server/sftp/    sftpd-openlist、x/crypto/ssh
+#
+#    ★ 关键约束：**SFTP 摘不掉 ftpserverlib**。
+#      server/sftp.go:28 调 ftp.InitStage()、:75 用 ftp.NewAferoAdapter(ctx)，
+#      而 server/ftp/ 子包（afero.go / fsup.go / site.go）用的是
+#      ftpserver.FileTransfer / AnswerCommand / ClientDriver / StatusOK 这些
+#      **真实类型** —— SFTP 的适配器就建在 FTP 那套 afero 适配器上。
+#      ⇒ 剥掉 FTP 监听器只能省 server/ftp.go 自己（约 20 KB），ftpserverlib
+#        必须留；而且 FTP 服务端用配置 "ftp":{"enable":false} 就能关
+#        （run.go:227 判 conf.Conf.FTP.Enable）。所以本 workflow 不支持剥 ftp，
+#        传了会硬失败并给出原因。
+#
+#    做法：把 server/s3.go、server/mcp.go 换成**保持函数签名的 stub**，
+#    于是 server/s3、server/mcp 两个包整个从依赖图里消失（连带 gofakes3、
+#    ncw/swift/v2）。**router.go / run.go 一行都不用改** —— stub 保留了
+#    S3() / S3Server() / MCP() 三个符号，调用点照样类型检查通过。
+#    stub 里路由仍然注册并返回 403，与 "enable": false 时的行为一致
+#    （客户端拿到干净的错误码，而不是 404）。
+#
+#    实测（arm64 / CGO_ENABLED=0 / -trimpath -tags=nomsgpack / -s -w / 全量驱动）：
+#      baseline                 73,466,016 B
+#      只去 MCP                 73,466,016 B   ← 段内容缩了 60 KB 但被文件对齐吃掉
+#      只去 S3                  73,072,800 B   (−384 KiB)
+#      去 S3 + MCP              72,941,728 B   (−512 KiB)
+#      xz -6 后                 16,947,436 B   (−125.6 KiB)
+#    ⇒ 净收益约 0.12 MiB（压缩后），约占 12.67 MiB 镜像的 1%。**收益很小**：
+#      只想要"只保留 sftp"的语义，用配置关掉三个协议就够了，不必重新构建。
+#
+#    ⚠ 陷阱：**单点改动与体积不成线性**。只去 MCP 时段内容确实缩了约 60 KB，
+#      但文件总长一模一样（Go 链接器文件级对齐/填充吸收）。所以"分别测 A 和 B
+#      再相加"不可靠（−384 + −61 ≠ −512）。要测就测组合。
+#
+#    ⚠ 被剥掉的协议，config.json 里的 "s3" / "mcp" 段仍然存在 —— 它们是
+#      internal/conf/config.go 里的 struct 字段，由 viper 统一解析，本身不占
+#      体积，删掉反而会让 admin API 报错。运行时把 enable 设成 false 即可。
+#
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      drivers:
+        description: >-
+          要保留的存储驱动，逗号或空格分隔。留空或填 all = 全量（87 个）。
+          可用名单：python3 build/gen_overlay.py --list-drivers
+          （AWS 系驱动：123 halalcloud mediatrack s3 teambition thunder
+            thunder_browser thunderx —— 勾了任意一个，aws-sdk-go 就会留在
+            二进制里，多约 7.7 MiB）
+        required: false
+        default: "local,alias,crypt,virtual,strm,url_tree,itvsh,115,139,quark_uc,webdav,ftp,smb,sftp"
+      strip_offline:
+        description: >-
+          true = 移除整个离线下载功能（连带 9 个硬编码驱动导入与所有下载工具）
+        required: false
+        type: boolean
+        default: true
+      strip_ffmpeg:
+        description: >-
+          true = 移除 ffmpeg（连带视频缩略图；图片与 PDF 缩略图不受影响）
+        required: false
+        type: boolean
+        default: true
+      db_backends:
+        description: >-
+          保留的数据库后端，逗号/空格分隔，all = 全留。已知：sqlite / mysql /
+          postgres。未保留的会从 internal/bootstrap/db.go 里摘掉（运行时选到
+          未保留的后端会 fatal "not supported database type: xxx"）。
+        required: false
+        default: "sqlite"
+      search_backends:
+        description: >-
+          保留的检索引擎，逗号/空格分隔，all = 全留（默认）。已知：bleve /
+          meilisearch。db 与 db_non_full_text 恒留。设为 "db,db_non_full_text"
+          可再省约 1.7 MiB（68 个包），代价是失去全文检索。
+        required: false
+        default: "all"
+      strip_protocols:
+        description: >-
+          要**剥掉**的服务端协议，逗号/空格分隔。已知：s3 / mcp。留空或 none = 全保留。
+          ftp 不在支持范围：SFTP 的适配器（server/ftp 子包）就建在 ftpserverlib 的
+          真实类型上，剥掉 FTP 监听器只能省 server/ftp.go 自己（约 20 KB），
+          而用 "ftp":{"enable":false} 就能关掉它。实测剥 s3+mcp 省约 512 KiB
+          裸二进制 / 约 125 KiB（xz 后）。被剥掉的协议路由仍注册并返回 403。
+        required: false
+        default: "none"
+      arch:
+        description: 目标架构
+        required: false
+        default: linux-arm64
+        type: choice
+        options:
+          - linux-arm64   # aarch64，现役设备在用
+          - linux-armv7   # 32 位 armhf，设备文档 §5-8 推荐（避 arm64 L2 arena map）
+          - linux-amd64
+      cdn:
+        description: 前端 CDN 基址（写进产物说明，运行时仍需配置 cdn 字段或 OPENLIST_CDN）
+        required: false
+        default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist"
+      compress:
+        description: 额外压缩。光猫场景请保持 none（见文档 §7）
+        required: false
+        default: none
+        type: choice
+        options:
+          - none
+          - upx
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: sqfs ${{ inputs.arch }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          fetch-tags: true
+
+      - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
+        id: short-sha
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.1"
+
+      # ---- 预热模块缓存 ----
+      # 必须显式做：strip_ffmpeg=false 时补丁脚本要用 `go list -m -f {{.Dir}}`
+      # 定位 ffmpeg-go 源码，缓存为空会直接失败。顺便让 go build 不必边编边下。
+      - name: Warm module cache
+        run: go mod download
+
+      # ---- 生成 overlay：驱动裁剪 + core 解耦 + 后端裁剪 + ffmpeg ----
+      # 脚本内联在下面（heredoc）。每处改写都锚定精确源码模式，锚点失配会
+      # 直接 ::error:: 失败，不会静默漏裁。
+      - name: Generate build overlay
+        id: overlay
+        # 输入一律经 env 传进来，**不要**在 run 里直接写 Actions 插值表达式：
+        # drivers 是自由文本，含引号或反引号时直接插值会破坏脚本（注入）。
+        # （本注释刻意不写那个表达式字面量 —— 即便在 shell 注释里，Actions
+        #   也会先解析一遍，见 build_minimal.yml 里同类提醒。）
+        env:
+          DRIVERS: ${{ inputs.drivers }}
+          STRIP_OFFLINE: ${{ inputs.strip_offline }}
+          STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
+          DB_BACKENDS: ${{ inputs.db_backends }}
+          SEARCH_BACKENDS: ${{ inputs.search_backends }}
+          STRIP_PROTOCOLS: ${{ inputs.strip_protocols }}
+        run: |
+          set -e
+          mkdir -p build
+
+          cat > build/gen_overlay.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Generate a `go build -overlay` for the trimmed OpenList build.
+
+          Everything the sqfs workflow needs to cut lives here, in one place:
+
+            1. drivers/all.go        keep only the drivers you selected
+            2. core couplings        several core files import specific drivers just to
+                                     type-assert on them; those imports sit in the always
+                                     linked package graph and must be rewritten too
+            3. drivers/local/util.go optionally drop ffmpeg (video thumbnails)
+            4. aws-sdk-go            drop OpenList's own awsutil usage
+            5. gorm backends         keep only the databases you selected
+            6. search engines        keep only the engines you selected
+
+          Every edit is anchored on an exact source pattern and aborts with ::error: when
+          a pattern is missing, so upstream drift is a hard failure, never a silently
+          mis-trimmed binary.
+
+          Run from the repository root:
+
+              python3 gen_overlay.py --out build/overlay \
+                  --drivers "local,115" --db-backends sqlite --strip-ffmpeg
+
+          Prints the absolute path of the generated overlay.json on the last line.
+          """
+
+          import argparse
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          ROOT = os.getcwd()  # run from the repository root
+
+          # ---------------------------------------------------------------- file paths
+          F_DRIVERS_ALL = "drivers/all.go"
+          F_OD_ALL = "internal/offline_download/all.go"
+          F_OD_ADD = "internal/offline_download/tool/add.go"
+          F_OD_TRANSFER = "internal/offline_download/tool/transfer.go"
+          F_OD_HANDLES = "server/handles/offline_download.go"
+          F_TORRENT = "server/handles/torrent.go"
+          F_SEARCH_UTIL = "internal/search/util.go"
+          F_REQUEST = "internal/net/request.go"
+          F_DB = "internal/bootstrap/db.go"
+          F_SEARCH_IMPORT = "internal/search/import.go"
+          F_LOCAL_UTIL = "drivers/local/util.go"
+          F_S3 = "server/s3.go"
+          F_MCP = "server/mcp.go"
+
+          DRIVERS_DIR = "drivers"
+          NON_DRIVER_PKGS = {"base", "template"}
+          MODULE = "github.com/OpenListTeam/OpenList/v4"
+          FFMPEG_MODULE = "github.com/u2takey/ffmpeg-go"
+
+          # Drivers that pull in aws-sdk-go. If any of them is selected, dropping
+          # OpenList's own awsutil usage buys nothing.
+          AWS_DRIVERS = {"123", "halalcloud", "mediatrack", "s3", "teambition",
+                         "thunder", "thunder_browser", "thunderx"}
+
+          DB_BACKENDS = {"mysql": "gorm.io/driver/mysql",
+                         "postgres": "gorm.io/driver/postgres"}
+          SEARCH_ENGINES = ("bleve", "meilisearch")
+
+          # Server protocols that can be stripped, mapped to their top-level file.
+          # `ftp` is deliberately absent: SFTP's adapter (server/ftp subpackage,
+          # reached via ftp.InitStage / ftp.NewAferoAdapter in server/sftp.go) is
+          # built on ftpserverlib's *real* types (FileTransfer, AnswerCommand,
+          # ClientDriver, StatusOK), so ftpserverlib stays linked no matter what.
+          # Stripping the FTP listener would save only server/ftp.go itself
+          # (~20 KB), and "ftp": {"enable": false} already turns it off at runtime.
+          PROTOCOLS = {"s3": F_S3, "mcp": F_MCP}
+
+          BANNER = "// Code generated by the build_sqfs overlay generator; DO NOT EDIT.\n"
+
+          DRIVER_IMPORT_RE = re.compile(
+              r'^\t(?:[A-Za-z_][A-Za-z0-9_]* )?"github\.com/OpenListTeam/OpenList/v4/drivers/[^"]+"\n',
+              re.M,
+          )
+          IMPORT_BLOCK_RE = re.compile(r'\nimport \(\n(.*?)\n\)\n', re.S)
+
+          # 189pc's torrent rapid-upload method, re-expressed as a structural interface so
+          # the assertion compiles without importing the driver package. In a build that
+          # ships no 189pc the assertion fails, exactly as it did before.
+          CAS_IFACE = ("interface {\n"
+                       "\t\tRapidUploadFromTorrent(context.Context, model.Obj, []byte, bool) (model.Obj, error)\n"
+                       "\t}")
+
+          ALL_STUB = BANNER + "package offline_download\n"
+
+          HANDLES_STUB = BANNER + '''package handles
+
+          import (
+          	"github.com/OpenListTeam/OpenList/v4/internal/offline_download/tool"
+          	"github.com/OpenListTeam/OpenList/v4/server/common"
+          	"github.com/gin-gonic/gin"
+          )
+
+          // Offline download is stripped from this build. The routes stay registered so
+          // clients get a clean error instead of a 404.
+          const offlineDownloadDisabled = "offline download is not available in this build"
+
+          func SetAria2(c *gin.Context)          { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetQbittorrent(c *gin.Context)    { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetTransmission(c *gin.Context)   { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func Set115(c *gin.Context)            { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func Set115Open(c *gin.Context)        { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func Set123Pan(c *gin.Context)         { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func Set123Open(c *gin.Context)        { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetPikPak(c *gin.Context)         { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetThunder(c *gin.Context)        { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetThunderX(c *gin.Context)       { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetThunderBrowser(c *gin.Context) { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+          func SetGuangYaPan(c *gin.Context)     { common.ErrorStrResp(c, offlineDownloadDisabled, 400) }
+
+          // OfflineDownloadTools keeps the original response shape (a list of tool names).
+          func OfflineDownloadTools(c *gin.Context) {
+          	common.SuccessResp(c, tool.Tools.NamesForPath(c.Query("path")))
+          }
+
+          type AddOfflineDownloadReq struct {
+          	Urls         []string `json:"urls"`
+          	Path         string   `json:"path"`
+          	Tool         string   `json:"tool"`
+          	DeletePolicy string   `json:"delete_policy"`
+          }
+
+          func AddOfflineDownload(c *gin.Context) {
+          	common.ErrorStrResp(c, offlineDownloadDisabled, 400)
+          }
+          '''
+
+          # Signature-preserving stubs for the strippable server protocols. Because
+          # these keep S3()/S3Server()/MCP() defined, server/router.go and
+          # internal/bootstrap/run.go need NO changes at all -- the packages they
+          # used to import (server/s3, server/mcp) simply stop being reachable, and
+          # gofakes3 / ncw-swift fall out of the dependency graph with them.
+          S3_STUB = BANNER + '''package server
+
+          import (
+          	"github.com/OpenListTeam/OpenList/v4/server/common"
+          	"github.com/gin-gonic/gin"
+          )
+
+          // The S3 server protocol is stripped from this build. Routes stay
+          // registered so clients get a clean 403 instead of a 404, matching
+          // what "s3": {"enable": false} does at runtime.
+          const s3ProtocolDisabled = "S3 server is not available in this build"
+
+          func S3(g *gin.RouterGroup) {
+          	g.Any("/*path", func(c *gin.Context) {
+          		common.ErrorStrResp(c, s3ProtocolDisabled, 403)
+          	})
+          }
+
+          func S3Server(g *gin.RouterGroup) {
+          	g.Any("/*path", func(c *gin.Context) {
+          		common.ErrorStrResp(c, s3ProtocolDisabled, 403)
+          	})
+          }
+          '''
+
+          MCP_STUB = BANNER + '''package server
+
+          import (
+          	"github.com/OpenListTeam/OpenList/v4/server/common"
+          	"github.com/gin-gonic/gin"
+          )
+
+          // The MCP server protocol is stripped from this build. The route stays
+          // registered so clients get a clean 403 instead of a 404.
+          const mcpProtocolDisabled = "MCP server is not available in this build"
+
+          func MCP(g *gin.RouterGroup) {
+          	g.Any("/mcp", func(c *gin.Context) {
+          		common.ErrorStrResp(c, mcpProtocolDisabled, 403)
+          	})
+          }
+          '''
+
+          PROTOCOL_STUBS = {"s3": S3_STUB, "mcp": MCP_STUB}
+
+          # ------------------------------------------------------------ small helpers
+
+          def die(msg):
+              sys.exit(f"::error::{msg}")
+
+
+          def read(rel):
+              path = os.path.join(ROOT, rel)
+              if not os.path.isfile(path):
+                  die(f"missing source file {rel}; upstream layout changed")
+              with open(path, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def sub_once(src, pattern, repl, label):
+              out, n = re.subn(pattern, repl, src, count=1, flags=re.M)
+              if n != 1:
+                  die(f"pattern not found ({label}); upstream source changed, "
+                      f"refusing to produce a mis-trimmed build")
+              return out
+
+
+          def cut_once(src, needle, label):
+              """Plain-string variant of sub_once, for import lines."""
+              if src.count(needle) != 1:
+                  die(f"expected exactly one {needle.strip()!r} ({label}); upstream source changed")
+              return src.replace(needle, "", 1)
+
+
+          def drop_unused_imports(src, label):
+              """Remove import lines whose local name no longer appears in the body."""
+              m = IMPORT_BLOCK_RE.search(src)
+              if not m:
+                  die(f"no import block in {label}")
+              block = m.group(1)
+              body = src[:m.start()] + src[m.end():]
+
+              kept, dropped = [], []
+              for line in block.split("\n"):
+                  s = line.strip()
+                  mm = re.match(r'^(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?"([^"]+)"$', s)
+                  if not mm:
+                      kept.append(line)
+                      continue
+                  alias, path = mm.group(1), mm.group(2)
+                  if alias in ("_", "."):
+                      kept.append(line)
+                      continue
+                  name = alias or path.rsplit("/", 1)[-1]
+                  if re.search(r'\b' + re.escape(name) + r'\b', body):
+                      kept.append(line)
+                  else:
+                      dropped.append(name)
+
+              if dropped:
+                  print(f"::notice::{label}: dropped unused imports: {', '.join(dropped)}")
+
+              while kept and not kept[0].strip():
+                  kept.pop(0)
+              while kept and not kept[-1].strip():
+                  kept.pop()
+              return src[:m.start()] + "\nimport (\n" + "\n".join(kept) + "\n)\n" + src[m.end():]
+
+
+          def parse_list(raw):
+              """'a,b c' -> {'a','b','c'}; empty or 'all' -> None (meaning: keep all)."""
+              items = [x for x in (raw or "").replace(",", " ").replace("\n", " ").split(" ") if x]
+              return None if (not items or items == ["all"]) else set(items)
+
+
+          # ------------------------------------------------------- 1. driver trimming
+
+          def known_drivers():
+              d = os.path.join(ROOT, DRIVERS_DIR)
+              out = []
+              for name in sorted(os.listdir(d)):
+                  if name in NON_DRIVER_PKGS or not os.path.isdir(os.path.join(d, name)):
+                      continue
+                  if any(f.endswith(".go") for f in os.listdir(os.path.join(d, name))):
+                      out.append(name)
+              return out
+
+
+          def gen_drivers_all(selected, total):
+              lines = [
+                  BANNER.rstrip("\n"),
+                  f"// Trimmed driver set ({len(selected)} of {total})"
+                  f" — see .github/workflows/build_sqfs.yml",
+                  "",
+                  "package drivers",
+                  "",
+                  "import (",
+              ]
+              lines += [f'\t_ "{MODULE}/drivers/{name}"' for name in selected]
+              lines += [
+                  ")",
+                  "",
+                  "// All do nothing,just for import",
+                  "// same as _ import",
+                  "func All() {",
+                  "}",
+                  "",
+              ]
+              return "\n".join(lines)
+
+
+          # ------------------------------------------- 2. offline download (optional)
+
+          def strip_add(src):
+              src = DRIVER_IMPORT_RE.sub("", src)
+              # The per-tool temp-dir switch only exists to detect the destination being
+              # the matching netdisk; without those drivers the whole block is dead.
+              src = sub_once(
+                  src,
+                  r'\n\t// 如果当前 storage 是对应网盘，则直接下载到目标路径，无需转存\n'
+                  r'\tswitch args\.Tool \{\n[\s\S]*?\n\t\}\n',
+                  '\n', "add.go tempDir switch",
+              )
+              src = sub_once(
+                  src,
+                  r'func ed2kToolForStorage\(storage driver\.Driver\) string \{\n[\s\S]*?\n\}\n',
+                  'func ed2kToolForStorage(storage driver.Driver) string {\n\treturn ""\n}\n',
+                  "add.go ed2kToolForStorage",
+              )
+              src = sub_once(
+                  src,
+                  r'func toolNameForStorage\(storage driver\.Driver\) string \{\n[\s\S]*?\n\}\n',
+                  'func toolNameForStorage(storage driver.Driver) string {\n\treturn ""\n}\n',
+                  "add.go toolNameForStorage",
+              )
+              return drop_unused_imports(src, "add.go")
+
+
+          def strip_transfer(src):
+              src = DRIVER_IMPORT_RE.sub("", src)
+              # 189pc-only rapid upload (秒传) inside transferStdFile
+              src = sub_once(
+                  src,
+                  r'\n\t// 尝试对天翼云进行秒传（计算 MD5 \+ sliceMD5）\n'
+                  r'\tif rapidObj, rapidErr := tryRapidUpload189\([\s\S]*?\n\t\}\n',
+                  '\n', "transfer.go rapid-upload call",
+              )
+              # the helper itself, which is the last function in the file
+              src = sub_once(src, r'\n// tryRapidUpload189[\s\S]*$', '\n',
+                             "transfer.go tryRapidUpload189")
+              return drop_unused_imports(src, "transfer.go")
+
+
+          def strip_offline_download(replacements):
+              replacements[F_OD_ALL] = ALL_STUB
+              replacements[F_OD_ADD] = strip_add(read(F_OD_ADD))
+              replacements[F_OD_TRANSFER] = strip_transfer(read(F_OD_TRANSFER))
+              replacements[F_OD_HANDLES] = HANDLES_STUB
+
+
+          # --------------------------------------- 2b. driver couplings in core code
+
+          def ensure_import(src, path):
+              if re.search(r'^\t(?:[A-Za-z_][A-Za-z0-9_]* )?"' + re.escape(path) + r'"\n', src, re.M):
+                  return src
+              return sub_once(src, r'\nimport \(\n', f'\nimport (\n\t"{path}"\n',
+                              f"ensure import {path}")
+
+
+          def strip_torrent(src):
+              src = DRIVER_IMPORT_RE.sub("", src)
+              src = src.replace("storage.(*_189pc.Cloud189PC)", "storage.(" + CAS_IFACE + ")")
+              src = ensure_import(src, "context")
+              return drop_unused_imports(src, "torrent.go")
+
+
+          def strip_search(src):
+              src = DRIVER_IMPORT_RE.sub("", src)
+              # v3Visited only feeds the OpenList branch that is about to disappear
+              src = sub_once(src, r'\n\tv3Visited := make\(map\[string\]bool\)', '',
+                             "search/util.go v3Visited")
+              # The OpenList driver is not in this build, so `Name == "OpenList"` can never
+              # be true; keeping only the else-branch is behaviour-preserving.
+              src = sub_once(
+                  src,
+                  r'\t\t\tif storage\.Config\(\)\.Name == "OpenList" \{\n[\s\S]*?\n'
+                  r'\t\t\t\} else \{\n'
+                  r'\t\t\t\tignorePaths = append\(ignorePaths, storage\.GetStorage\(\)\.MountPath\)\n'
+                  r'\t\t\t\}\n',
+                  '\t\t\tignorePaths = append(ignorePaths, storage.GetStorage().MountPath)\n',
+                  "search/util.go OpenList branch",
+              )
+              return drop_unused_imports(src, "search/util.go")
+
+
+          # ------------------------------------------------- 3. ffmpeg (video thumbs)
+
+          def strip_local_ffmpeg(src):
+              """Drop ffmpeg-go from drivers/local.
+
+              `GetSnapshot` shells out to ffmpeg/ffprobe to grab a video frame, and
+              ffmpeg-go imports aws-sdk-go unconditionally. Removing it costs video
+              thumbnails only; image and PDF thumbnails keep working.
+              """
+              src = sub_once(
+                  src,
+                  r'\n// Get the snapshot of the video\n'
+                  r'func \(d \*Local\) GetSnapshot\([\s\S]*?\n\}\n',
+                  '\n', "local/util.go GetSnapshot",
+              )
+              src = sub_once(
+                  src,
+                  r'\tif typeName == conf\.VIDEO \{\n'
+                  r'\t\tvideoBuf, err := d\.GetSnapshot\(fullPath\)\n'
+                  r'\t\tif err != nil \{\n'
+                  r'\t\t\treturn nil, nil, err\n'
+                  r'\t\t\}\n'
+                  r'\t\tsrcBuf = videoBuf\n'
+                  r'\t\} else if d\.supportsPDFThumbnail\(file\.GetName\(\)\) \{\n',
+                  '\tif typeName == conf.VIDEO {\n'
+                  '\t\treturn nil, nil, errs.NotSupport\n'
+                  '\t} else if d.supportsPDFThumbnail(file.GetName()) {\n',
+                  "local/util.go getThumb video branch",
+              )
+              src = sub_once(
+                  src,
+                  r'\tif typeName == conf\.IMAGE \|\| typeName == conf\.VIDEO \{\n',
+                  '\tif typeName == conf.IMAGE {\n',
+                  "local/util.go supportsThumbnail",
+              )
+              src = drop_unused_imports(src, "local/util.go")
+              if FFMPEG_MODULE in src or "ffmpeg" in src:
+                  die("residual ffmpeg reference in drivers/local/util.go after strip")
+              return BANNER + src
+
+
+          # --------------------------------------------------- 4. aws-sdk-go (request)
+
+          def strip_request_aws(src):
+              """Drop OpenList's own aws-sdk-go reference.
+
+              internal/net/request.go uses awsutil.Copy only to deep-copy an
+              HttpRequestParams{URL, Range, HeaderRef, Size}. Both call sites mutate only
+              Range afterwards, so a plain struct copy is behaviourally equivalent.
+              """
+              src = cut_once(src, '\t"github.com/aws/aws-sdk-go/aws/awsutil"\n',
+                             "request.go awsutil import")
+              src = sub_once(src, r'awsutil\.Copy\(&finalP, p\)', 'finalP = *p',
+                             "request.go awsutil.Copy #1")
+              src = sub_once(src, r'awsutil\.Copy\(&params, d\.params\)', 'params = *d.params',
+                             "request.go awsutil.Copy #2")
+              if "awsutil" in src:
+                  die("residual awsutil reference in internal/net/request.go")
+              return BANNER + src
+
+
+          # ------------------------------------------ 5/6. database + search backends
+
+          def strip_db(src, keep):
+              """Drop the gorm drivers for backends outside `keep`.
+
+              The `default:` arm of the type switch already fatals with
+              "not supported database type: <x>", so removing a case degrades to a clean
+              startup error rather than a compile error.
+              """
+              for name, path in DB_BACKENDS.items():
+                  if name in keep:
+                      continue
+                  src = cut_once(src, f'\t"{path}"\n', f"db.go {name} import")
+                  src = sub_once(
+                      src,
+                      r'\n\t\tcase "' + name + r'":\n\t\t\t\{\n[\s\S]*?\n\t\t\t\}\n',
+                      '\n', f"db.go {name} case",
+                  )
+              return BANNER + drop_unused_imports(src, "bootstrap/db.go")
+
+
+          def strip_search_imports(src, keep):
+              for name in SEARCH_ENGINES:
+                  if name in keep:
+                      continue
+                  src = cut_once(
+                      src,
+                      f'\t_ "{MODULE}/internal/search/{name}"\n',
+                      f"search/import.go {name}",
+                  )
+              return BANNER + src
+
+
+          # ------------------------------------------- 7. server protocols (optional)
+
+          def strip_protocols(replacements, remove):
+              """Swap server/<proto>.go for a stub that keeps its exported symbols.
+
+              Stubbing (rather than deleting) is what lets router.go / run.go stay
+              untouched: the call sites still type-check, while server/<proto> and
+              everything only it imported drop out of the dependency graph.
+              """
+              for name in sorted(remove):
+                  replacements[PROTOCOLS[name]] = PROTOCOL_STUBS[name]
+              return sorted(remove)
+
+
+          # --------------------------------------------- optional: patch ffmpeg-go
+
+          def patch_ffmpeg_module(out_dir):
+              """Copy ffmpeg-go somewhere writable, strip its aws-sdk-go imports, and
+              emit an alternate go.mod that `replace`s the module with our copy.
+
+              `go build -overlay` refuses to replace files under GOMODCACHE
+              ("Files beneath GOMODCACHE must not be replaced"), so a module-level patch
+              has to go through -modfile. Only needed when ffmpeg is KEPT and no
+              AWS-backed driver is selected; if ffmpeg is stripped there is nothing to
+              patch. Returns the modfile path.
+              """
+              try:
+                  src_dir = subprocess.run(
+                      ["go", "list", "-m", "-f", "{{.Dir}}", FFMPEG_MODULE],
+                      cwd=ROOT, capture_output=True, text=True, check=True,
+                  ).stdout.strip()
+              except subprocess.CalledProcessError as e:
+                  die(f"go list -m {FFMPEG_MODULE} failed: {e.stderr.strip()}")
+              if not src_dir or not os.path.isdir(src_dir):
+                  die(f"{FFMPEG_MODULE} not in the module cache ({src_dir!r}); "
+                      f"run `go mod download` first")
+
+              dst_dir = os.path.join(out_dir, "ffmpeg-go")
+              if os.path.isdir(dst_dir):
+                  shutil.rmtree(dst_dir)
+              shutil.copytree(src_dir, dst_dir)
+              for root, dirs, files in os.walk(dst_dir):  # the module cache is read-only
+                  for name in dirs + files:
+                      p = os.path.join(root, name)
+                      try:
+                          os.chmod(p, os.stat(p).st_mode | 0o200)
+                      except OSError:
+                          pass
+
+              ff = os.path.join(dst_dir, "ffmpeg.go")
+              with open(ff, encoding="utf-8") as f:
+                  src = f.read()
+              for imp in ('\t"github.com/aws/aws-sdk-go/aws"\n',
+                          '\t"github.com/aws/aws-sdk-go/aws/session"\n',
+                          '\t"github.com/aws/aws-sdk-go/service/s3/s3manager"\n'):
+                  src = cut_once(src, imp, f"ffmpeg.go {imp.strip()}")
+              # the s3:// dispatch in Stream.Output, then the helper it calls
+              src = sub_once(
+                  src,
+                  r'\tif strings\.HasPrefix\(fileName, "s3://"\) \{\n'
+                  r'\t\treturn s\.outputS3Stream\(fileName, kwargs\.\.\.\)\n'
+                  r'\t\}\n',
+                  '', "ffmpeg.go Output() s3 branch",
+              )
+              src = sub_once(
+                  src,
+                  r'\nfunc \(s \*Stream\) outputS3Stream\(fileName string, kwargs \.\.\.KwArgs\) \*Stream \{\n'
+                  r'[\s\S]*?\n\}\n',
+                  '\n', "ffmpeg.go outputS3Stream",
+              )
+              for imp in ('\t"io"\n', '\t"os"\n', '\t"strings"\n'):
+                  src = cut_once(src, imp, f"ffmpeg.go dead import {imp.strip()}")
+              for token in ("aws-sdk-go", "s3manager", "outputS3Stream", "io.", "os.", "strings."):
+                  if token in src:
+                      die(f"residual {token!r} in ffmpeg-go after patch")
+              with open(ff, "w", encoding="utf-8", newline="\n") as f:
+                  f.write(src)
+
+              mod_dst = os.path.join(out_dir, "slim.mod")
+              sum_src = os.path.join(ROOT, "go.sum")
+              if not os.path.isfile(sum_src):
+                  die("go.sum not found; run `go mod download` first")
+              shutil.copyfile(os.path.join(ROOT, "go.mod"), mod_dst)
+              shutil.copyfile(sum_src, os.path.join(out_dir, "slim.sum"))
+              with open(mod_dst, "a", encoding="utf-8", newline="\n") as f:
+                  f.write(f"\nreplace {FFMPEG_MODULE} => {dst_dir.replace(os.sep, '/')}\n")
+              print(f"::notice::patched {FFMPEG_MODULE} (aws-sdk-go removed) -> {dst_dir}")
+              return mod_dst.replace("\\", "/")
+
+
+          # ------------------------------------------------------------------- main
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--out", help="directory for generated files (required unless --list-drivers)")
+              ap.add_argument("--drivers", default="all",
+                              help="drivers to KEEP (comma/space separated, or 'all')")
+              ap.add_argument("--list-drivers", action="store_true",
+                              help="print every known driver name and exit")
+              ap.add_argument("--strip-offline", action="store_true",
+                              help="remove the whole offline-download feature")
+              ap.add_argument("--strip-ffmpeg", action="store_true",
+                              help="drop ffmpeg-go (and video thumbnails) from drivers/local")
+              ap.add_argument("--db-backends", default="all",
+                              help="database backends to KEEP; known: sqlite/mysql/postgres")
+              ap.add_argument("--search-backends", default="all",
+                              help="search engines to KEEP; known: bleve/meilisearch")
+              ap.add_argument("--strip-protocols", default="none",
+                              help="server protocols to REMOVE; known: s3/mcp "
+                                   "(ftp is unsupported -- see the header's section 12)")
+              args = ap.parse_args()
+
+              available = known_drivers()
+              if args.list_drivers:
+                  print(",".join(available))
+                  return 0
+
+              if not args.out:
+                  die("--out is required")
+
+              wanted = parse_list(args.drivers)
+              if wanted is None:
+                  selected, full = available, True
+              else:
+                  unknown = sorted(wanted - set(available))
+                  if unknown:
+                      die(f"unknown driver(s): {','.join(unknown)}; "
+                          f"known: {','.join(available)}")
+                  selected, full = sorted(wanted), False
+
+              db_keep = parse_list(args.db_backends)
+              search_keep = parse_list(args.search_backends)
+
+              # `none` is the documented spelling for "strip nothing"; parse_list
+              # only treats empty / "all" as the keep-everything sentinel.
+              proto_remove = {p for p in (parse_list(args.strip_protocols) or set())
+                              if p != "none"}
+              unknown = sorted(proto_remove - set(PROTOCOLS))
+              if unknown:
+                  hint = ""
+                  if "ftp" in unknown:
+                      hint = ("\n  ftp is not strippable: SFTP's adapter (the server/ftp"
+                              " subpackage, via ftp.InitStage / ftp.NewAferoAdapter in"
+                              " server/sftp.go) is built on ftpserverlib's real types,"
+                              " so ftpserverlib stays linked either way and only"
+                              " server/ftp.go itself (~20 KB) would go.\n"
+                              "  Turn it off at runtime instead: \"ftp\": {\"enable\": false}")
+                  die(f"unknown protocol(s): {','.join(unknown)}; "
+                      f"known: {','.join(sorted(PROTOCOLS))}{hint}")
+
+              out = os.path.abspath(args.out)
+              if os.path.isdir(out):
+                  shutil.rmtree(out)
+              os.makedirs(out)
+
+              replacements = {F_DRIVERS_ALL: gen_drivers_all(selected, len(available))}
+
+              if args.strip_offline:
+                  strip_offline_download(replacements)
+
+              # ---- server protocols (s3 / mcp) ----
+              if proto_remove:
+                  strip_protocols(replacements, proto_remove)
+                  print(f"::notice::server protocol(s) stripped: "
+                        f"{', '.join(sorted(proto_remove))}")
+
+              # ---- conditional on the selected driver set ----
+              if "189pc" in selected and not full:
+                  print("::notice::189pc is selected; keeping the torrent 189pc coupling")
+              else:
+                  replacements[F_TORRENT] = strip_torrent(read(F_TORRENT))
+
+              if "openlist" in selected and not full:
+                  print("::notice::openlist is selected; keeping the search openlist coupling")
+              else:
+                  replacements[F_SEARCH_UTIL] = strip_search(read(F_SEARCH_UTIL))
+
+              aws_conflict = sorted(AWS_DRIVERS if full else AWS_DRIVERS & set(selected))
+              strip_aws = False
+              if full or aws_conflict:
+                  why = "full build" if full else f"selected drivers need it: {', '.join(aws_conflict)}"
+                  print(f"::notice::keeping OpenList's awsutil usage ({why})")
+              else:
+                  replacements[F_REQUEST] = strip_request_aws(read(F_REQUEST))
+                  strip_aws = True
+
+              # ---- ffmpeg ----
+              if args.strip_ffmpeg:
+                  if "local" in selected or full:
+                      replacements[F_LOCAL_UTIL] = strip_local_ffmpeg(read(F_LOCAL_UTIL))
+                      print("::notice::ffmpeg stripped: video thumbnails disabled")
+              # ---- explicit backend selection ----
+              if db_keep:
+                  dropped = sorted(set(DB_BACKENDS) - db_keep)
+                  if dropped:
+                      replacements[F_DB] = strip_db(read(F_DB), db_keep)
+              if search_keep:
+                  dropped = sorted(set(SEARCH_ENGINES) - search_keep)
+                  if dropped:
+                      replacements[F_SEARCH_IMPORT] = strip_search_imports(read(F_SEARCH_IMPORT), search_keep)
+
+              replace_map = {}
+              for rel, content in replacements.items():
+                  dest = os.path.join(out, rel.replace("/", "_"))
+                  with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                      f.write(content)
+                  replace_map[rel] = dest.replace("\\", "/")
+
+              overlay_path = os.path.join(out, "overlay.json")
+              with open(overlay_path, "w", encoding="utf-8") as f:
+                  json.dump({"Replace": replace_map}, f, indent=2)
+
+              # The ffmpeg-go module patch is only worth doing when ffmpeg is KEPT (if it
+              # is stripped there is nothing to patch) and OpenList's own awsutil usage is
+              # gone (otherwise aws-sdk-go stays anyway).
+              modfile = ""
+              if strip_aws and not args.strip_ffmpeg and (full or "local" in selected):
+                  modfile = patch_ffmpeg_module(out)
+
+              meta = {
+                  "drivers": selected,
+                  "drivers_full": full,
+                  "strip_offline": bool(args.strip_offline),
+                  "strip_ffmpeg": bool(args.strip_ffmpeg),
+                  "strip_aws": strip_aws,
+                  "modfile": modfile,
+                  "db_backends": sorted(db_keep) if db_keep else "all",
+                  "search_backends": sorted(search_keep) if search_keep else "all",
+                  "strip_protocols": sorted(proto_remove) if proto_remove else "none",
+                  "rewrites": sorted(replacements),
+              }
+              with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+                  json.dump(meta, f, indent=2)
+
+              print(f"::notice::drivers: {len(selected)}/{len(available)}"
+                    + (" (full)" if full else " (trimmed)"))
+              print(f"::notice::rewrites: {', '.join(sorted(replacements))}")
+              print(f"::notice::strip_aws={strip_aws} strip_ffmpeg={args.strip_ffmpeg} "
+                    f"db={meta['db_backends']} search={meta['search_backends']} "
+                    f"protocols={meta['strip_protocols']}")
+              print(overlay_path.replace("\\", "/"))
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+          ARGS=(--out build/overlay
+                --drivers "$DRIVERS"
+                --db-backends "$DB_BACKENDS"
+                --search-backends "$SEARCH_BACKENDS"
+                --strip-protocols "$STRIP_PROTOCOLS")
+          [ "$STRIP_OFFLINE" = "true" ] && ARGS+=(--strip-offline)
+          [ "$STRIP_FFMPEG"  = "true" ] && ARGS+=(--strip-ffmpeg)
+
+          OVERLAY=$(python3 build/gen_overlay.py "${ARGS[@]}" | tail -1)
+          MODFILE=$(python3 -c "import json;print(json.load(open('build/overlay/meta.json'))['modfile'])")
+
+          echo "overlay=$OVERLAY" >> "$GITHUB_OUTPUT"
+          echo "modfile=$MODFILE" >> "$GITHUB_OUTPUT"
+          cat build/overlay/meta.json
+          cat "$OVERLAY"
+
+      # ---- 注意：这里刻意没有 "Setup web" 步骤 ----
+      # build_minimal.yml 那一步会 bash build.sh release web 把前端下载到
+      # public/dist，然后被 //go:embed 吸进二进制。本 workflow 要的是 CDN 版，
+      # 所以必须跳过，public/dist 保持仓库里的 README.md 占位（全空目录会让
+      # //go:embed all:dist 报 "contains no embeddable files"）。
+
+      - name: Build (pure Go, CGO_ENABLED=0)
+        env:
+          TARGET: ${{ inputs.arch }}
+          OVERLAY: ${{ steps.overlay.outputs.overlay }}
+          MODFILE: ${{ steps.overlay.outputs.modfile }}
+        run: |
+          set -e
+          case "$TARGET" in
+            linux-arm64) export GOARCH=arm64; unset GOARM ;;
+            linux-armv7) export GOARCH=arm;   export GOARM=7 ;;
+            linux-amd64) export GOARCH=amd64; unset GOARM ;;
+          esac
+          export GOOS=linux
+          export CGO_ENABLED=0
+
+          # ⚠ LDFLAGS 只放**链接器**参数。-trimpath 不是链接器参数（它属于
+          #   go build），写进来会让 `go tool link` 报 "flag provided but not
+          #   defined: -trimpath" 并打出 usage，构建失败。trimpath 统一放在
+          #   下面的 build args 里。
+          # Version 用 runner 自带的 GITHUB_REF_NAME，**不要**用 Actions 表达式
+          #   展开：分支名里的引号或空格会破坏 LDFLAGS 的引号分组。
+          LDFLAGS="-s -w \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$(date +'%F %T %z')' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$(git rev-parse HEAD)' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${GITHUB_REF_NAME}' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling'"
+
+          # -tags=nomsgpack 摘掉 gin 的 msgpack 绑定（连带 ugorji/go/codec 2.93MB）
+          # 不传 jsoniter：项目里没有这个 build tag，是死开关（见文档 §8）
+          args=(-trimpath -tags=nomsgpack -overlay="$OVERLAY"
+                -ldflags="$LDFLAGS" -o build/openlist .)
+          if [ -n "$MODFILE" ]; then
+            args=(-modfile="$MODFILE" "${args[@]}")
+            echo "::notice::using patched modfile: $MODFILE"
+          fi
+          go build "${args[@]}"
+          ls -l build/openlist
+
+      - name: Optional UPX (default off)
+        if: ${{ inputs.compress == 'upx' }}
+        run: |
+          set -e
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          before=$(stat -c %s build/openlist)
+          upx -9 build/openlist
+          upx -t build/openlist
+          echo "::warning::UPX 版在光猫上会把解压体驻留匿名内存，不要用于 F4610U"
+          echo "::notice::upx: $before -> $(stat -c %s build/openlist)"
+
+      # ---- 打包 squashfs ----
+      - name: Install squashfs-tools
+        run: |
+          set -e
+          if ! command -v mksquashfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq squashfs-tools
+          fi
+          mksquashfs -version
+
+      - name: Pack openlist.sqfs
+        run: |
+          set -e
+          stage=build/sqfs-stage/openlist
+          mkdir -p "$stage"
+          cp build/openlist "$stage/openlist"
+          # ★ 可执行位必须显式设。设备侧 openlist_start.sh 启动前会做
+          #   `[ ! -x "$APP" ]` 检查，镜像内文件不可执行就直接拒绝启动。
+          #   go build 的产物本来就是 0755，这里再钉一次是为了不依赖上游行为
+          #   或 runner 的 umask。
+          chmod 755 "$stage/openlist"
+          rm -f build/openlist.sqfs
+          # ★ 源目录必须是 stage/openlist 本身，不能是它的父目录：
+          #   mksquashfs 把「源目录的内容」当作镜像根。传父目录会让镜像里多出
+          #   一层 openlist/（inodes=3），挂载后变成 /opt/sq/openlist/openlist/openlist，
+          #   设备侧 openlist_start.sh 找不到可执行文件。现役镜像 inodes=2 即为此。
+          # -comp xz -b 1M 是设备侧实测结论（128K 块大 3.4 MiB；-Xbcj arm 对
+          #   AArch64 无效，不加）。-noappend 保证幂等，重跑不会往旧镜像里追加。
+          # -all-root 让镜像内文件归 root:root。CI 里 mksquashfs 以 runner
+          #   (uid 1001) 运行，不加这个参数镜像里就是 1001:1001 —— 与设备现役
+          #   镜像（编译机上以 root 打的）不一致。mode 不受影响，仍是 0755。
+          mksquashfs "$stage" build/openlist.sqfs -comp xz -b 1M -noappend -all-root
+          echo "--- raw vs sqfs ---"
+          du -h "$stage/openlist" build/openlist.sqfs
+          echo "--- image header ---"
+          unsquashfs -s build/openlist.sqfs
+
+          # ---- 断言：镜像内 openlist 必须可执行且属主为 root ----
+          # 打包完立刻验，别把一个设备侧起不来的镜像发出去。
+          echo "--- image contents ---"
+          unsquashfs -ll build/openlist.sqfs
+          line=$(unsquashfs -ll build/openlist.sqfs | grep 'squashfs-root/openlist$' || true)
+          case "$line" in
+            -rwxr-xr-x\ root/root*)
+              echo "::notice::镜像内 openlist 权限 OK: $line" ;;
+            *)
+              echo "::error::镜像内 openlist 权限不对（期望 -rwxr-xr-x root/root）：$line"
+              exit 1 ;;
+          esac
+
+      - name: Publish to GitHub Release
+        # 同样经 env 传输入，避免自由文本（drivers）插值进 shell。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.short-sha.outputs.sha }}
+          TARGET: ${{ inputs.arch }}
+          COMPRESS: ${{ inputs.compress }}
+          DRIVERS: ${{ inputs.drivers }}
+          STRIP_OFFLINE: ${{ inputs.strip_offline }}
+          STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
+          DB_BACKENDS: ${{ inputs.db_backends }}
+          SEARCH_BACKENDS: ${{ inputs.search_backends }}
+          STRIP_PROTOCOLS: ${{ inputs.strip_protocols }}
+          CDN: ${{ inputs.cdn }}
+        run: |
+          set -e
+          tag="ci-sqfs-${SHA}"
+          name="openlist.sqfs_${TARGET}_${COMPRESS}"
+          mv build/openlist.sqfs "build/${name}"
+
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" \
+              --title "SquashFS build ${SHA}" \
+              --prerelease \
+              --target "${GITHUB_SHA}" \
+              --notes "$(printf 'CDN + 裁剪驱动的 squashfs 镜像。\n\n- commit: %s\n- 架构: %s\n- 驱动: %s\n- 离线下载: %s\n- ffmpeg: %s\n- 数据库后端: %s\n- 检索引擎: %s\n- 剥掉的服务端协议: %s\n- 压缩: %s\n- 前端 CDN: %s\n\n镜像内可执行文件名为 openlist，挂载到 /opt/sq/openlist 后直接运行。\n运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动会 Fatal。\n\n注意：\n1. 裁剪掉的驱动若在数据库中已有对应存储，启动时会报 no driver named: xxx，需先删除该存储记录。\n2. 未保留的数据库后端在运行时会被 fatal 拒绝（not supported database type）。\n3. 离线下载为 true 时 /api/fs/add_offline_download 返回业务码 400。\n4. ffmpeg 为 true 时视频缩略图不可用（图片/PDF 缩略图正常）。\n5. 服务端协议栏列出的是被剥掉的协议（none = 全保留）。被剥掉的协议路由仍然注册并返回 403，行为等同于运行时把 enable 设为 false；config.json 里的对应段仍存在但已失效。ftp 不可剥离（SFTP 的适配器建在 ftpserverlib 上），需要关闭请设 "ftp":{"enable":false}。\n\n精简方法论见 .github/workflows/build_sqfs.yml 头部文档。' \
+                "${GITHUB_SHA}" "${TARGET}" "${DRIVERS}" "${STRIP_OFFLINE}" "${STRIP_FFMPEG}" "${DB_BACKENDS}" "${SEARCH_BACKENDS}" "${STRIP_PROTOCOLS}" "${COMPRESS}" "${CDN}")"
+
+          gh release upload "$tag" "build/${name}" --clobber
+          echo "::notice::released ${tag}: ${name} ($(stat -c %s "build/${name}") bytes)"

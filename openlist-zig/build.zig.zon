@@ -1,0 +1,22 @@
+.{
+    .name = .openlist_zig,
+    .version = "0.2.0",
+    // Zig 0.17.0 (released 2026-10-01). This is a hard floor, not a
+    // preference: 0.15/0.16 moved `std.fs`/`std.net` into `std.Io` and rewrote
+    // `std.http`, and 0.17 finished that migration by removing
+    // `std.fs.File`/`std.fs.Dir`/`std.net` entirely and changing the entry
+    // point to `pub fn main(init: std.process.Init)`.
+    //
+    // The project deliberately tracks the newest release rather than the
+    // oldest that happens to compile — see docs/STATUS.md, §5（工具链/版本策略）.
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xc931a122efdcbf42,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "README.md",
+    },
+}

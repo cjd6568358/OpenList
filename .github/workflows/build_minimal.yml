@@ -1,32 +1,74 @@
 name: Minimal Build
 
-# 精简版构建：按需选择目标 + 链接方式 + 前端变体 + 是否 UPX 压缩。
+# 精简版构建：按需选择目标 + 链接方式 + 是否 UPX 压缩。
 # 触发：推送到 feat/zhijiadisk 分支，或手动 workflow_dispatch（见 on:）。
 #
-# 与 build.yml 的区别：
-#   1. matrix 不同（这里用 include 逐条列举，方便注释掉不想要的目标）
-#   2. 新增两种非静态-链接的 linux 变体（见下）
-#   3. 新增 lite 前端变体、UPX 压缩变体
-#   4. 新增「汇总」job：等全部变体跑完后，生成一份按代理域名分组、
-#      列出该 Release 全部产物的 proxy_<sha>.txt 并上传到 WebDAV。
-#      这是全局唯一产生下载清单、且唯一写 WebDAV 的地方（见下）。
+# ============================================================================
+#  本 workflow 相对上游 build.yml 的两处改造（都是为了减体积）
+# ============================================================================
+#
+#  ① 前端走 CDN —— 不再把前端 dist 嵌进二进制
+#     上游做法是 `bash build.sh release web` 把前端下载到 public/dist，
+#     再由 public/public.go 的 `//go:embed all:dist` 吸进二进制（标准版
+#     ~55MB，是二进制的绝对大头）。本 workflow **跳过 Setup web 步骤**，
+#     public/dist 保持仓库里的 README.md 占位，体积立刻掉一大截。
+#
+#     ⚠ 代价（部署时必须知道）：
+#       - 运行时要配 `cdn`（config.json 的 cdn 字段，或环境变量 OPENLIST_CDN），
+#         否则启动直接 Fatal —— 见 server/static/static.go 的 initIndex：
+#         只有 `DistDir == "" && Cdn != "" && WebVersion ∈ {"", beta, dev, rolling}`
+#         才走 CDN 分支，三个条件缺一不可。
+#       - WebVersion 必须是 rolling（或空/beta/dev）。本 workflow 的
+#         LDFLAGS 与 cgo-actions 的 x-flags 都已经写死 `WebVersion=rolling`。
+#       - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回头去读内嵌的
+#         index.html 然后 Fatal。
+#       - CDN 地址里别写 `$version`：代码会把 `$version` 替换成 WebVersion
+#         即 `rolling`，而 npm 上没有 rolling 这个 dist-tag。用 `@latest`
+#         或写死版本号。
+#       环境变量是 `OPENLIST_CDN=`，不是裸 `CDN=`。
+#
+#  ② 数据库只留 SQLite —— 摘掉 mysql / postgres
+#     internal/bootstrap/db.go **无条件** import 了
+#     `gorm.io/driver/mysql` 与 `gorm.io/driver/postgres`（连带 pgx、
+#     go-sql-driver/mysql），没有任何 build tag 可以关掉 —— 注意
+#     `sqlite_cgo_compat` 那个 tag 管的是 **sqlite 用哪个实现**
+#     （glebarez 纯 Go vs mattn cgo），跟 mysql/postgres 无关。
+#     所以本 workflow 在构建前用一段内联 Python **原地改写** db.go，
+#     把这两个 import 与它们的 case 分支删掉，只留 `case "sqlite3"` 和
+#     `default:`（default 会干净地 fatal："not supported database type: x"）。
+#     实测省约 3.69 MiB。
+#
+#     ⚠ 代价：config.json 里若写 `"type": "mysql"` 或 `"postgres"`，
+#       启动会立刻 fatal 退出。这两个后端的用户请用 build.yml / 上游发行版。
+#
+#     为什么是「原地改写」而不是 build_sqfs.yml 那种 `-overlay`：
+#     本 workflow 的 cgo 变体走 OpenListTeam/cgo-actions（Docker 里跑 xgo），
+#     把 `-overlay=<绝对路径>` 穿过 action 的 flags 有不确定性；而 CI 的
+#     工作区本来就是一次性的，原地改最稳、对 cgo 与纯 Go 两条路径一视同仁。
+#     （build_sqfs.yml 是单一设备镜像、只走纯 Go，所以那边用 overlay 更干净。）
+#
+# ============================================================================
+#  以下为上游原有说明（链接方式 / UPX / 产物分发），仍适用
+# ============================================================================
+#
+# 链接方式说明（务必看，选错会白跑）：
+#   linux-*-musl     musl 工具链 + CGO，-static 全静态。体积最大，兼容性最好。
+#   linux-*          xgo（docker glibc）+ CGO，动态链接。需目标机 glibc >= 构建镜像。
+#   linux-*-nocgo    CGO_ENABLED=0 纯 Go，不含任何 libc。通常比 musl 版还小，
+#                    且无 glibc 版本要求；amd64/arm64 上 sqlite 走 glebarez 纯 Go 驱动。
+#                    ⚠ 此变体无法走 cgo-actions（它会强制 CGO_ENABLED=1），
+#                      由下面的 "Build (pure Go)" 步骤直接用 go build 完成。
+#
+# UPX 说明：只对 linux 生效（windows 不做，原因见 "Compress with UPX" 步骤注释）。
+#   本 workflow 已改走 CDN，二进制里没有前端了，UPX 对纯 Go 产物的收益更值得试。
 #
 # 产物分发渠道（两条，互不影响）：
 #   GitHub Release  可执行文件本体，见 build job 的 "Publish to GitHub Release"。
 #                   proxy_<sha>.txt 里的加速地址指向这里，所以它是下载链路的
 #                   最终来源，WebDAV 只是清单托管处。
 #   WebDAV          只传一份 proxy_<sha>.txt（下载地址清单）。
-#                   产物本体不传 —— 几十 MB × 25 个变体是重复占用，而 txt
+#                   产物本体不传 —— 几十 MB × 十几个变体是重复占用，而 txt
 #                   里的加速地址指向 Release、不经过 WebDAV，代理下载已够用。
-#                   想恢复产物镜像：见 summarize 里 "Upload to WebDAV" 的注释。
-#
-# 下载地址清单：summarize 生成 proxy_<sha>.txt，列出该 Release 里成功的全部
-#   产物，上传到 WebDAV <WEBDAV_DIR>/（无 commit 子目录，commit 在文件名里），
-#   再把它作为正文发一封邮件。build job 不经手 WebDAV，只把产物交给 Release。
-#
-#   ⚠ 代价：下载地址要等 build 全部跑完才可用。build 失败/被 cancel 时
-#   summarize 不跑（它靠 always() 只在 build 结束后启动），此时 WebDAV 上
-#   可能没有清单 —— 从 Release 页面取产物即可，Release 是源头。
 #
 # 邮件配置（仓库 Settings → Secrets and variables → Actions 里加）：
 #   vars.SMTP_HOST          SMTP 服务器，如 smtp.qq.com
@@ -37,22 +79,6 @@ name: Minimal Build
 #   secrets.SMTP_PASSWORD   密码 / 授权码 —— 多数邮箱要用「SMTP 授权码」，
 #                           不是网页登录密码，用错会得到 535 认证失败。
 #   任一项缺失时脚本打 notice 后正常返回，不视为构建失败。
-#
-# 链接方式说明（务必看，选错会白跑）：
-#   linux-*-musl     musl 工具链 + CGO，-static 全静态。体积最大，兼容性最好。
-#   linux-*          xgo（docker glibc）+ CGO，动态链接。需目标机 glibc >= 构建镜像。
-#   linux-*-nocgo    CGO_ENABLED=0 纯 Go，不含任何 libc。通常比 musl 版还小，
-#                    且无 glibc 版本要求；amd64/arm64 上 sqlite 走 glebarez 纯 Go 驱动。
-#                    ⚠ 此变体无法走 cgo-actions（它会强制 CGO_ENABLED=1），
-#                      由下面的 "Build (pure Go)" 步骤直接用 go build 完成。
-#
-# 体积提醒：二进制的绝对大头是 go:embed 进去的前端 dist（标准版 ~55MB）。
-#   lite 前端对该体积的影响远大于链接方式，想瘦身优先看 lite 那条。
-#
-# UPX 说明：只对 linux 生效（windows 不做，原因见 "Compress with UPX" 步骤注释）。
-#   收益差别很大：纯 Go(nocgo) 产物明显，musl/glibc 产物很小 —— 体积大头是
-#   **已经压缩过**的前端 dist，再压一遍榨不出多少。所以 UPX 让变体数翻倍，
-#   换来的体积收益有限；真要瘦身请看 lite 前端。
 #
 # 不需要的目标/变体，直接把 include 里对应那两行注释掉即可。
 
@@ -87,94 +113,42 @@ jobs:
         include:
           # ---- Windows 10+ x86-64（产物 openlist.exe）----
           - target: windows-amd64
-            frontend: lite
             compress: none
 
-          # ---- Linux，musl 全静态（原有）----
+          # ---- Linux，musl 全静态 ----
           # - target: linux-amd64-musl
-          #   frontend: full
           #   compress: none
           # - target: linux-arm64-musl
-          #   frontend: full
           #   compress: none
 
-          # ---- Linux，glibc 动态链接（新增）----
+          # ---- Linux，glibc 动态链接 ----
           # - target: linux-amd64
-          #   frontend: full
           #   compress: none
           # - target: linux-arm64
-          #   frontend: full
           #   compress: none
 
-          # ---- Linux，纯 Go 零依赖 CGO_ENABLED=0（新增）----
+          # ---- Linux，纯 Go 零依赖 CGO_ENABLED=0 ----
           # - target: linux-amd64-nocgo
-          #   frontend: full
           #   compress: none
           # - target: linux-arm64-nocgo
-          #   frontend: full
           #   compress: none
 
-          # ---- lite 前端变体（体积大头在这里）----
+          # ---- UPX 压缩变体（仅 linux）----
+          # 想让变体数减少，把不需要的行注释掉即可。
           # - target: linux-amd64-musl
-          #   frontend: lite
-          #   compress: none
-          # - target: linux-arm64-musl
-          #   frontend: lite
-          #   compress: none
-          # - target: linux-amd64
-          #   frontend: lite
-          #   compress: none
-          # - target: linux-arm64
-          #   frontend: lite
-          #   compress: none
-          # - target: linux-amd64-nocgo
-          #   frontend: lite
-          #   compress: none
-          # - target: linux-arm64-nocgo
-          #   frontend: lite
-          #   compress: none
-
-          # ---- UPX 压缩变体（仅 linux；三种链接方式 × 两种前端 = 12 条）----
-          # 想让变体数减半、只保留收益较大的 nocgo 那几条，
-          # 把 musl / glibc 对应的行注释掉即可（详见文件头的 UPX 说明）。
-          # - target: linux-amd64-musl
-          #   frontend: full
           #   compress: upx
           # - target: linux-arm64-musl
-          #   frontend: full
           #   compress: upx
           # - target: linux-amd64
-          #   frontend: full
           #   compress: upx
           # - target: linux-arm64
-          #   frontend: full
-          #   compress: upx
-          # - target: linux-amd64-nocgo
-          #   frontend: full
-          #   compress: upx
-          # - target: linux-arm64-nocgo
-          #   frontend: full
-          #   compress: upx
-          # - target: linux-amd64-musl
-          #   frontend: lite
-          #   compress: upx
-          # - target: linux-arm64-musl
-          #   frontend: lite
-          #   compress: upx
-          # - target: linux-amd64
-          #   frontend: lite
-          #   compress: upx
-          # - target: linux-arm64
-          #   frontend: lite
           #   compress: upx
           - target: linux-amd64-nocgo
-            frontend: lite
             compress: upx
           - target: linux-arm64-nocgo
-            frontend: lite
             compress: upx
 
-    name: Build ${{ matrix.target }} (${{ matrix.frontend }}, ${{ matrix.compress }})
+    name: Build ${{ matrix.target }} (${{ matrix.compress }})
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -193,19 +167,78 @@ jobs:
         with:
           go-version: "1.27.1"
 
-      - name: Setup web
-        # release -> FetchWebRelease：拉前端最新**稳定** release，
-        # 而非 dev 走的 edge 滚动通道。
-        # lite 参数会让 FetchWebRelease 挑 openlist-frontend-dist-lite 那个包。
+      - name: Strip MySQL/PostgreSQL (SQLite only)
+        # 原地改写 internal/bootstrap/db.go：摘掉 mysql / postgres 两个
+        # gorm 驱动（连带 pgx、go-sql-driver/mysql），只留 sqlite3。
+        # 见文件头 ② 的说明。每处改写都锚定精确源码模式，锚点失配直接
+        # ::error:: 失败，不会静默留下一个「以为裁了其实没裁」的产物。
         run: |
-          if [ "${{ matrix.frontend }}" = "lite" ]; then
-            bash build.sh release lite web
-          else
-            bash build.sh release web
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
+          set -e
+          python3 - <<'PYEOF'
+          import re
+          import sys
+
+          PATH = "internal/bootstrap/db.go"
+          IMPORTS = {"mysql": '\t"gorm.io/driver/mysql"\n',
+                     "postgres": '\t"gorm.io/driver/postgres"\n'}
+
+          src = open(PATH, encoding="utf-8").read()
+
+          for name, imp in IMPORTS.items():
+              if src.count(imp) != 1:
+                  sys.exit(f"::error::expected exactly one {imp.strip()!r} "
+                           f"in {PATH}; upstream changed")
+              src = src.replace(imp, "", 1)
+              pat = r'\n\t\tcase "' + name + r'":\n\t\t\t\{\n[\s\S]*?\n\t\t\t\}\n'
+              src, n = re.subn(pat, "\n", src, count=1, flags=re.M)
+              if n != 1:
+                  sys.exit(f'::error::case "{name}" not found in {PATH}; '
+                           f"upstream changed")
+
+          # 顺手摘掉因上面改动而变得没人用的 import（当前应无，防御性）
+          m = re.search(r'\nimport \(\n(.*?)\n\)\n', src, re.S)
+          if not m:
+              sys.exit(f"::error::no import block in {PATH}")
+          block = m.group(1)
+          body = src[:m.start()] + src[m.end():]
+          kept, dropped = [], []
+          for line in block.split("\n"):
+              s = line.strip()
+              mm = re.match(r'^(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?"([^"]+)"$', s)
+              if not mm:
+                  kept.append(line)
+                  continue
+              alias, path = mm.group(1), mm.group(2)
+              if alias in ("_", "."):
+                  kept.append(line)
+                  continue
+              nm = alias or path.rsplit("/", 1)[-1]
+              if re.search(r'\b' + re.escape(nm) + r'\b', body):
+                  kept.append(line)
+              else:
+                  dropped.append(nm)
+          if dropped:
+              print("::notice::dropped unused imports:", ", ".join(dropped))
+          while kept and not kept[0].strip():
+              kept.pop(0)
+          while kept and not kept[-1].strip():
+              kept.pop()
+          src = src[:m.start()] + "\nimport (\n" + "\n".join(kept) + "\n)\n" + src[m.end():]
+
+          open(PATH, "w", encoding="utf-8", newline="\n").write(src)
+          print(f"::notice::stripped mysql/postgres from {PATH}")
+          PYEOF
+          echo "--- 改写后的 import 块 ---"
+          sed -n '1,20p' internal/bootstrap/db.go
+          echo "--- 剩余的后端分支 ---"
+          grep -n 'case "\|default:' internal/bootstrap/db.go
+
+      # ---- 注意：这里刻意没有 "Setup web" 步骤 ----
+      # 上游 build_minimal.yml 会 `bash build.sh release web` 把前端下载到
+      # public/dist 再被 //go:embed 吸进二进制。本 workflow 走 CDN，所以跳过；
+      # public/dist 保持仓库里的 README.md 占位（全空目录会让
+      # //go:embed all:dist 报 "contains no embeddable files"）。
+      # 见文件头 ① 的运行时要求。
 
       - name: Build (cgo)
         # nocgo 变体走下面独立的 go build 步骤，这里跳过。
@@ -250,6 +283,7 @@ jobs:
           #   Actions 也会先解析，空表达式会让整个 workflow 校验失败。）
           # ⚠ cgo 那侧走的是 cgo-actions 的 $tag，两者不一定相等 ——
           #   想让同名变体自报一致，需要核对 cgo-actions 里 $tag 的实际取值。
+          # WebVersion=rolling 是 CDN 分支的硬要求，见文件头 ①。
           LDFLAGS="-w -s \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$(date +'%F %T %z')' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
@@ -346,19 +380,19 @@ jobs:
       # - name: Upload artifact
       #   uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       #   with:
-      #     name: openlist_${{ matrix.target }}_${{ matrix.frontend }}_${{ matrix.compress }}
+      #     name: openlist_${{ matrix.target }}_${{ matrix.compress }}
       #     overwrite: true
       #     path: build/*
 
       - name: Stage artifact with descriptive name
         # 产物编译出来统一叫 openlist[.exe]，变体信息只存在于目录/文件名里。
         # 后续 Release asset 的命名都从这里来，
-        # 不带变体信息的话 25 个变体会同名互相覆盖。
+        # 不带变体信息的话多个变体会同名互相覆盖。
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -e
-          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
+          name="openlist_${TARGET}_${{ matrix.compress }}"
           case "$TARGET" in
             *windows*) mv build/openlist.exe "build/${name}.exe"; echo "::notice::staged build/${name}.exe" ;;
             *)         mv build/openlist     "build/${name}";     echo "::notice::staged build/${name}" ;;
@@ -374,7 +408,7 @@ jobs:
         # tag 用 ci-<commit>：每个 commit 一个 Release，永久归档、互不覆盖。
         # 因为 tag 里已含 commit，asset 名就不再重复带 commit。
         #
-        # ⚠ 25 个 matrix job 并发跑这一段，必然有多个 job 同时想创建同一个
+        # ⚠ 多个 matrix job 并发跑这一段，必然有多个 job 同时想创建同一个
         #   Release。谁先谁赢，其余拿到 422 —— 那不是错误，故显式容忍。
         #
         # GITHUB_SHA / GITHUB_REF_NAME / GITHUB_EVENT_NAME 由 runner 提供。
@@ -382,7 +416,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.short-sha.outputs.sha }}
           TARGET: ${{ matrix.target }}
-          MATRIX_DESC: ${{ matrix.target }} / ${{ matrix.frontend }} / ${{ matrix.compress }}
+          MATRIX_DESC: ${{ matrix.target }} / ${{ matrix.compress }}
         run: |
           set -e
           tag="ci-${SHA}"
@@ -397,7 +431,7 @@ jobs:
                  --title "CI build ${SHA}" \
                  --prerelease \
                  --target "${GITHUB_SHA}" \
-                 --notes "$(printf '由 build_minimal.yml 自动构建。\n\n- commit: %s\n- 分支: %s\n- 变体: %s\n- 触发: %s\n\nasset 为可直接运行的可执行文件（未压缩）。\n各文件名对应不同链接方式/前端/压缩组合。\nCI 产物未经发布流程验证，请自行核对。' \
+                 --notes "$(printf '由 build_minimal.yml 自动构建（CDN 前端 + 仅 SQLite 数据库）。\n\n- commit: %s\n- 分支: %s\n- 变体: %s\n- 触发: %s\n\n⚠ 部署须知：\n1. 本产物不含内嵌前端，运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动 Fatal。\n2. 本产物只支持 SQLite；config.json 里若把 type 写成 mysql 或 postgres，启动会立刻 fatal。\n\nCI 产物未经发布流程验证，请自行核对。' \
                    "${GITHUB_SHA}" "${GITHUB_REF_NAME}" "${MATRIX_DESC}" "${GITHUB_EVENT_NAME}")"; then
               # 竞态：别的 job 抢先创建了。确认它确实存在即可继续。
               if gh release view "$tag" >/dev/null 2>&1; then
@@ -409,10 +443,10 @@ jobs:
             fi
           fi
 
-          # 上传上一步暂存的裸二进制。显式带上 matrix.frontend / compress
+          # 上传上一步暂存的裸二进制。显式带上 matrix.compress
           # 拼出确定的名字，不用通配符：build/ 里可能有别的东西，通配会
           # 静默挑错文件。
-          name="openlist_${TARGET}_${{ matrix.frontend }}_${{ matrix.compress }}"
+          name="openlist_${TARGET}_${{ matrix.compress }}"
           case "$TARGET" in
             *windows*) asset="build/${name}.exe" ;;
             *)         asset="build/${name}" ;;
@@ -437,7 +471,6 @@ jobs:
     #       (2) 上传到 WebDAV
     #       (3) 把它作为正文发一封邮件
     # 顺序是「先上传、再发信」：邮件说出「已经在 WebDAV 上」时，它确实在。
-    # 详见文件头「下载地址清单」一段。
     needs: build
     if: ${{ always() }}
     runs-on: ubuntu-latest
