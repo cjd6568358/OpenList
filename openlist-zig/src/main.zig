@@ -20,8 +20,11 @@ const driver = @import("driver.zig");
 const log = @import("log.zig");
 const http = @import("http.zig");
 const api = @import("api.zig");
+const client = @import("client.zig");
+const cookiejar = @import("cookiejar.zig");
 const model = @import("model.zig");
 const json = @import("util/json.zig");
+const hashmod = @import("util/hash.zig");
 const urlmod = @import("util/url.zig");
 const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
@@ -29,10 +32,22 @@ const rt = @import("rt.zig");
 
 pub const version = "0.1.0-zig";
 
+/// `openlist admin [random | set <pwd> | token]` —— 对齐 Go `cmd/admin.go`
+/// （官方 FAQ「忘记密码怎么办」给的就是这两个命令）。无参数等价于 Go 的
+/// `openlist admin`：只打印账号信息与提示。
+const AdminCmd = union(enum) {
+    info,
+    random,
+    set: []const u8,
+    token,
+};
+
 const Options = struct {
     config_path: []const u8 = "data/config.json",
     port_override: ?u16 = null,
     log_level: ?log.Level = null,
+    /// 非 null 时走管理命令分支，**不**启动 HTTP 服务（对齐 Go 的 CLI 子命令）。
+    admin: ?AdminCmd = null,
 };
 
 /// 0.17 changed the entry point: instead of a zero-argument `main` plus global
@@ -59,8 +74,31 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
 
+    // 管理命令（`openlist admin …`）：只读写 config.json，**不**起 HTTP 服务。
+    // 对齐 Go `cmd/admin.go` —— 它也是 bootstrap.Init() 后直接改库再退出。
+    if (opts.admin) |act| {
+        const acfg = config.load(gpa, opts.config_path) catch |e| {
+            std.debug.print("cannot load config {s}: {s}\n", .{ opts.config_path, @errorName(e) });
+            return e;
+        };
+        defer acfg.deinit();
+        return runAdmin(acfg, gpa, act);
+    }
+
     const cfg = config.load(gpa, opts.config_path) catch |e| {
         std.debug.print("cannot load config {s}: {s}\n", .{ opts.config_path, @errorName(e) });
+        return e;
+    };
+
+    // 对齐 Go `internal/bootstrap/data/user.go:initAdmin`：无管理员时**只有**
+    // 设了 `OPENLIST_ADMIN_PASSWORD` 才自动创建 `admin`，否则保持未初始化、
+    // 交给 Web 安装向导（`POST /api/public/init/setup`）。
+    initAdminFromEnv(init, cfg) catch |e| {
+        std.debug.print("cannot initialise admin from OPENLIST_ADMIN_PASSWORD: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    ensureToken(cfg) catch |e| {
+        std.debug.print("cannot persist admin token: {s}\n", .{@errorName(e)});
         return e;
     };
 
@@ -84,6 +122,8 @@ pub fn main(init: std.process.Init) !void {
     driver.persist_hook = persistStorage;
 
     var app = try api.App.init(gpa);
+    // Strm 驱动要回调本实例其他挂载（Go 直接调 internal/fs）—— 装上桥接。
+    app.installFsBridge();
     // The frontend arena is the one large allocation worth accounting for; the
     // rest of `App` is process-lifetime.
     defer app.deinit();
@@ -155,7 +195,10 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("admin: {s} ({s})", .{
         app.admin_user,
-        if (app.admin_hash.len > 0) "configured" else "NOT configured — POST /api/auth/register",
+        if (app.admin_hash.len > 0)
+            "configured"
+        else
+            "NOT configured — open the Web setup wizard, or run `openlist admin set NEW_PASSWORD`",
     });
 
     try server.run();
@@ -354,6 +397,191 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 }
 
 // ---------------------------------------------------------------------------
+// CLI 子命令（对齐 Go `cmd/admin.go` + `internal/bootstrap/data/user.go`）
+// ---------------------------------------------------------------------------
+
+/// 字母数字字符集，与 Go `pkg/utils/random/random.go` 的 `letterBytes` 逐字一致。
+const rand_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Go `random.String(n)`：n 位字母数字，取自 `crypto/rand`。
+/// 0.17 移除了 `std.crypto.random`，熵改从 `Io` 句柄取（`rt.io().random`，
+/// ChaCha CSPRNG，种子来自 OS）—— 与 config.zig 的 `randomSecret` 同一套做法。
+fn randomString(buf: []u8) []const u8 {
+    var raw: [1]u8 = undefined;
+    for (buf) |*c| {
+        rt.io().random(&raw);
+        c.* = rand_letters[raw[0] % rand_letters.len];
+    }
+    return buf;
+}
+
+/// RFC 4122 v4 UUID，小写带连字符 —— 与 Go `google/uuid` 的 `NewString()` 同形。
+fn formatUuidV4(out: *[36]u8) void {
+    var b: [16]u8 = undefined;
+    rt.io().random(&b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    const hex = "0123456789abcdef";
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < 16) : (i += 1) {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            out[j] = '-';
+            j += 1;
+        }
+        out[j] = hex[b[i] >> 4];
+        out[j + 1] = hex[b[i] & 0x0f];
+        j += 2;
+    }
+}
+
+/// Go `random.Token()` = `"openlist-" + uuid.NewString() + String(64)`。
+/// `buf` 至少要 9 + 36 + 64 = 109 字节。
+fn randomToken(buf: []u8) []const u8 {
+    var uuid: [36]u8 = undefined;
+    formatUuidV4(&uuid);
+    const head = std.fmt.bufPrint(buf, "openlist-{s}", .{uuid}) catch return buf[0..0];
+    const n = head.len;
+    _ = randomString(buf[n .. n + 64]);
+    return buf[0 .. n + 64];
+}
+
+/// 对齐 Go `internal/bootstrap/data/user.go:initAdmin`。
+///
+/// 无管理员时：设了 `OPENLIST_ADMIN_PASSWORD` 就以 `admin` 为用户名建管理员，
+/// 并把密码打印到**控制台**（Go 明确要求不写进日志文件）；没设就什么都不做，
+/// 保持未初始化，交给 Web 安装向导（`POST /api/public/init/setup`）。
+fn initAdminFromEnv(init: std.process.Init, cfg: *config.Config) !void {
+    if (cfg.raw("zig.admin_password_hash") != null) return; // 已有管理员
+    const pwd = init.environ_map.get("OPENLIST_ADMIN_PASSWORD") orelse return;
+    if (pwd.len == 0) return;
+
+    const ca = cfg.allocator();
+    // 对齐 Go `User.SetPassword`：现生成 16 位 salt，存 `TwoHashPwd(pwd, salt)`。
+    const salt = try api.randomSalt(ca);
+    const hash = try api.twoHashPwd(ca, pwd, salt);
+    try cfg.putZig("admin_user", .{ .string = try ca.dupe(u8, "admin") });
+    try cfg.putZig("admin_salt", .{ .string = salt });
+    try cfg.putZig("admin_password_hash", .{ .string = hash });
+    try cfg.putZig("admin_pwd_ts", .{ .int = rt.nowSeconds() });
+    try cfg.save();
+    // Go: `DO NOT output the password to log file. Only output to console.`
+    std.debug.print("Successfully created the admin user and the initial password is: {s}\n", .{pwd});
+}
+
+/// 首次启动生成 `zig.token` —— 对齐 Go：`random.Token()` 在 `InitialSettings()`
+/// 里就写进了 settings 表，服务与 CLI 共用同一个串（`cmd/user.go` 的
+/// `DelUserCacheOnline` 正是拿它做认证）。缺了它，CLI 改完密码就没法通知
+/// 在线服务热重载。
+fn ensureToken(cfg: *config.Config) !void {
+    if (cfg.raw("zig.token") != null) return;
+    var buf: [128]u8 = undefined;
+    const gen = randomToken(&buf);
+    try cfg.putZig("token", .{ .string = try cfg.allocator().dupe(u8, gen) });
+    try cfg.save();
+}
+
+/// `openlist admin [random | set <pwd> | token]` —— 对齐 Go `cmd/admin.go`。
+fn runAdmin(cfg: *config.Config, gpa: std.mem.Allocator, act: AdminCmd) !void {
+    const ca = cfg.allocator();
+    const username = if (cfg.raw("zig.admin_user")) |v| (v.asStr() orelse "admin") else "admin";
+    const has_admin = cfg.raw("zig.admin_password_hash") != null;
+
+    switch (act) {
+        .info => {
+            if (!has_admin) {
+                std.debug.print("no administrator yet — use the Web setup wizard, or set OPENLIST_ADMIN_PASSWORD\n", .{});
+                return;
+            }
+            std.debug.print("Admin user's username: {s}\n", .{username});
+            std.debug.print("The password can only be output at the first startup, and then stored as a hash value, which cannot be reversed\n", .{});
+            std.debug.print("You can reset the password with a random string by running [openlist admin random]\n", .{});
+            std.debug.print("You can also set a new password by running [openlist admin set NEW_PASSWORD]\n", .{});
+        },
+        .random => {
+            if (!has_admin) return error.NoAdministrator;
+            var buf: [8]u8 = undefined;
+            const pwd = randomString(&buf);
+            try setAdminPassword(cfg, pwd);
+            std.debug.print("admin user has been updated:\nusername: {s}\npassword: {s}\n", .{ username, pwd });
+            notifyReload(cfg, gpa);
+        },
+        .set => |pwd| {
+            if (!has_admin) return error.NoAdministrator;
+            try setAdminPassword(cfg, pwd);
+            std.debug.print("admin user has been updated:\nusername: {s}\npassword: {s}\n", .{ username, pwd });
+            notifyReload(cfg, gpa);
+        },
+        .token => {
+            // Go 的 token 存在 settings 表（供 WebDAV / API 的静态 token 认证）。
+            // 本工程没有那张表，改用 `zig.token`：首次读取时生成并落盘，之后稳定。
+            var tok: []const u8 = "";
+            if (cfg.raw("zig.token")) |v| tok = v.asStr() orelse "";
+            if (tok.len == 0) {
+                var buf: [128]u8 = undefined;
+                const gen = randomToken(&buf);
+                const owned = try ca.dupe(u8, gen);
+                try cfg.putZig("token", .{ .string = owned });
+                try cfg.save();
+                tok = owned;
+            }
+            std.debug.print("Admin token: {s}\n", .{tok});
+        },
+    }
+}
+
+/// 改完凭据后通知**在线**服务热重载 —— 对齐 Go `DelAdminCacheOnline`
+/// （`cmd/user.go:15`：改完库再 POST `/api/admin/user/del_cache`）。
+/// 服务没起、还没 token、或请求失败都只提示一句：重启同样能生效，
+/// 不该让一次 CLI 操作因为服务不在而报错。
+fn notifyReload(cfg: *config.Config, gpa: std.mem.Allocator) void {
+    const port = cfg.http_port;
+    if (port <= 0 or port > 65535) return;
+    const tok = if (cfg.raw("zig.token")) |v| (v.asStr() orelse "") else "";
+    if (tok.len == 0) {
+        std.debug.print("note: restart the server for the change to take effect\n", .{});
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var jar = cookiejar.Jar.init(gpa);
+    defer jar.deinit();
+    var c = client.Client.init(gpa, .{ .timeout_s = 3 }, &jar);
+    defer c.deinit();
+
+    const url = std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api/admin/user/del_cache", .{@as(u16, @intCast(port))}) catch return;
+    const res = c.send(a, .{
+        .method = "POST",
+        .url = url,
+        .headers = &.{.{ .name = "Authorization", .value = tok }},
+        .body = "",
+    }) catch {
+        std.debug.print("note: could not reach the running server — restart it for the change to take effect\n", .{});
+        return;
+    };
+    if (res.isOk()) {
+        std.debug.print("running server notified (del_cache) — the new password is already in effect\n", .{});
+    } else {
+        std.debug.print("note: server answered {d} — restart it for the change to take effect\n", .{res.status});
+    }
+}
+
+fn setAdminPassword(cfg: *config.Config, pwd: []const u8) !void {
+    const ca = cfg.allocator();
+    // 对齐 Go `User.SetPassword`：改密就换 salt，重算 `TwoHashPwd`。
+    const salt = try api.randomSalt(ca);
+    const hash = try api.twoHashPwd(ca, pwd, salt);
+    try cfg.putZig("admin_salt", .{ .string = salt });
+    try cfg.putZig("admin_password_hash", .{ .string = hash });
+    // 推进口令版本：所有**已签发**的旧令牌立即失效（对齐 Go 的 `user.PwdTS`）。
+    try cfg.putZig("admin_pwd_ts", .{ .int = rt.nowSeconds() });
+    try cfg.save();
+}
+
+// ---------------------------------------------------------------------------
 // Args
 // ---------------------------------------------------------------------------
 
@@ -368,6 +596,10 @@ fn parseArgs(init: std.process.Init) !Options {
 
     var out = Options{};
     _ = args.next(); // argv[0]
+
+    // 第一遍：吃 flag、收集 positional。flag 与 positional 可以交错
+    // （`openlist server --config X`），所以不能边扫边解释子命令。
+    var positionals = List([]const u8).init(a);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
             out.config_path = try a.dupe(u8, args.next() orelse return error.MissingValue);
@@ -389,19 +621,59 @@ fn parseArgs(init: std.process.Init) !Options {
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownFlag;
         } else {
-            // Bare positional argument: treat as the config path, matching the
-            // Go build's `openlist [config]` form.
-            out.config_path = try a.dupe(u8, arg);
+            try positionals.append(arg);
         }
     }
+
+    // 第二遍：解释 positional。第一个词是子命令（Go 用 cobra，`server` /
+    // `admin` 都是子命令）；都不是时沿用旧行为当成 config path
+    // （`openlist [config]`）。
+    var i: usize = 0;
+    const items = positionals.slice();
+    if (i < items.len and std.mem.eql(u8, items[i], "server")) {
+        i += 1; // 与默认行为一致：起服务
+    } else if (i < items.len and std.mem.eql(u8, items[i], "admin")) {
+        i += 1;
+        out.admin = blk: {
+            if (i >= items.len) break :blk AdminCmd.info;
+            const act = items[i];
+            if (std.mem.eql(u8, act, "random")) {
+                i += 1;
+                break :blk AdminCmd.random;
+            }
+            if (std.mem.eql(u8, act, "token")) {
+                i += 1;
+                break :blk AdminCmd.token;
+            }
+            if (std.mem.eql(u8, act, "set")) {
+                i += 1;
+                // Go：`if len(args) == 0 { return fmt.Errorf("Please enter the new password") }`
+                if (i >= items.len) return error.MissingValue;
+                const pwd = items[i];
+                i += 1;
+                break :blk .{ .set = pwd };
+            }
+            // 未知 action：按 Go 的裸 `openlist admin` 处理（只打印信息）。
+            break :blk AdminCmd.info;
+        };
+    }
+    if (i < items.len) out.config_path = items[i];
     return out;
 }
 
 const USAGE =
     \\OpenList (zig) — a minimal OpenList-compatible server
     \\
-    \\Usage: openlist [options] [config.json]
+    \\Usage: openlist [command] [options] [config.json]
     \\
+    \\Commands:
+    \\  server                   start the server (default)
+    \\  admin                    show the admin user's info and password hints
+    \\  admin random             reset the admin password to a random string
+    \\  admin set NEW_PASSWORD   set a new admin password
+    \\  admin token              show the admin token
+    \\
+    \\Options:
     \\  -c, --config <path>     config file (default: data/config.json)
     \\      --data <dir>        use <dir>/config.json
     \\      --port <n>          override scheme.http_port
@@ -411,6 +683,8 @@ const USAGE =
     \\
     \\Environment:
     \\  OPENLIST_LOG_LEVEL      default log level when --log-level is absent
+    \\  OPENLIST_ADMIN_PASSWORD first run only: create `admin` with this password
+    \\                          (otherwise the Web setup wizard does it)
     \\
 ;
 
@@ -430,4 +704,81 @@ test "normalizeMountPath" {
 
 test "version string is non-empty" {
     try testing.expect(version.len > 0);
+}
+
+test "randomString / randomToken match Go's alphabet and shape" {
+    var buf: [8]u8 = undefined;
+    const s = randomString(&buf);
+    try testing.expectEqual(@as(usize, 8), s.len);
+    for (s) |c| try testing.expect(std.mem.indexOfScalar(u8, rand_letters, c) != null);
+
+    // Go `random.Token()` = "openlist-" + uuid(36) + String(64)
+    var tbuf: [128]u8 = undefined;
+    const t = randomToken(&tbuf);
+    try testing.expect(std.mem.startsWith(u8, t, "openlist-"));
+    try testing.expectEqual(@as(usize, "openlist-".len + 36 + 64), t.len);
+    const uuid = t["openlist-".len..][0..36];
+    try testing.expectEqual(@as(u8, '-'), uuid[8]);
+    try testing.expectEqual(@as(u8, '-'), uuid[13]);
+    try testing.expectEqual(@as(u8, '-'), uuid[18]);
+    try testing.expectEqual(@as(u8, '-'), uuid[23]);
+    try testing.expectEqual(@as(u8, '4'), uuid[14]); // version nibble
+}
+
+test "admin set/random persist a verifiable hash and bump the password version" {
+    // 对齐官方 FAQ「忘记密码怎么办」：`openlist admin set NEW_PASSWORD` /
+    // `admin random`。两个命令都必须落 sha256 hash 并推进 `admin_pwd_ts`
+    // （否则改完密码，旧令牌还能继续用）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{dir});
+    defer testing.allocator.free(path);
+    const prev_cfg = config.getOpt();
+    const cfg = try config.load(testing.allocator, path);
+    defer cfg.deinit();
+    config.setForTest(cfg);
+    defer config.setForTest(prev_cfg);
+
+    // 无管理员时两个命令都必须拒绝（Go：`op.GetAdmin()` 失败就 return）。
+    try testing.expectError(error.NoAdministrator, runAdmin(cfg, testing.allocator, .{ .set = "x" }));
+    try testing.expectError(error.NoAdministrator, runAdmin(cfg, testing.allocator, .random));
+
+    try cfg.putZig("admin_user", .{ .string = try cfg.allocator().dupe(u8, "admin") });
+    try cfg.putZig("admin_salt", .{ .string = try cfg.allocator().dupe(u8, "0123456789abcdef") });
+    try cfg.putZig("admin_password_hash", .{ .string = "placeholder" });
+
+    const before = rt.nowSeconds();
+    try runAdmin(cfg, testing.allocator, .{ .set = "new-password" });
+    // 存的必须是 Go 形态 `TwoHashPwd(pwd, salt)`，不是裸 sha256。
+    const salt = cfg.raw("zig.admin_salt").?.asStr().?;
+    try testing.expectEqual(@as(usize, 16), salt.len);
+    try testing.expectEqualStrings(
+        try api.twoHashPwd(a, "new-password", salt),
+        cfg.raw("zig.admin_password_hash").?.asStr().?,
+    );
+    try testing.expect(cfg.raw("zig.admin_pwd_ts").?.asInt().? >= before);
+
+    try runAdmin(cfg, testing.allocator, .random);
+    try testing.expectEqual(@as(usize, 64), cfg.raw("zig.admin_password_hash").?.asStr().?.len);
+}
+
+test "staticHash reproduces the exact hash the frontend sends" {
+    // 向量由 Python 独立算出：sha256("verify-pass-2" + "-" + StaticHashSalt)，
+    // 与用户 2026-10-13 从浏览器抓到的那条 `/api/auth/login/hash` 请求体
+    // **逐字节**一致。这条钉住的是「前端登录页的哈希算法」，不是我们自己的输出。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "7f3de24cc533f6ab126704856bec0e499b323e106e7f9dbf53f476d0ae26ec6b",
+        try api.staticHash(a, "verify-pass-2"),
+    );
+    // Go `model.StaticHashSalt`（internal/model/user.go:24）必须逐字节一致。
+    try testing.expectEqualStrings("https://github.com/alist-org/alist", api.static_hash_salt);
 }

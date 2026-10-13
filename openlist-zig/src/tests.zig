@@ -54,6 +54,7 @@ test {
     _ = @import("drivers/quarkuc.zig");
     _ = @import("drivers/pan115.zig");
     _ = @import("drivers/wopan.zig");
+    _ = @import("drivers/strm.zig");
 
     // App
     _ = @import("api.zig");

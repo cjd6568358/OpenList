@@ -144,9 +144,12 @@ def main():
     args = ap.parse_args()
     base = args.base.rstrip("/")
 
-    print("=== 0. 准备：注册/登录 ===")
+    print("=== 0. 准备：初始化/登录 ===")
     u, p = "e2eadmin", "e2e-test-123456"
-    req(base, "/api/auth/register", method="POST", body={"username": u, "password": p})
+    # Go **没有** `/api/auth/register`。首次建管理员用官方的 init/setup
+    # （server/handles/setup.go）；已初始化时它会返回 400，忽略即可，
+    # 直接用已有账号登录（凭据可用 --user/--password 覆盖）。
+    req(base, "/api/public/init/setup", method="POST", body={"username": u, "password": p})
     st, txt, _ = req(base, "/api/auth/login", method="POST", body={"username": u, "password": p})
     tok = (json.loads(txt).get("data") or {}).get("token")
     check("登录拿到 token", bool(tok))

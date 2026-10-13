@@ -25,12 +25,16 @@
 
 ## 关键工程约定
 
-- **编译/测试/打包统一走打包机 10.0.0.4**（Debian 13 x86_64，root/e3eb773F）。
-  只读用 `/root/.cache/` 工具链（zig 0.17.0）；源码与独立缓存放 `/root/olz-*`，
-  不得改环境或装工具链。**本机产物只能自测，不能当交付。**
-- **Zig 0.17.0 硬下界**。本机路径 `C:/Users/Administrator/.workbuddy-ai/binaries/zig/0.17.0/`。
-- **本机 D 盘跑 `zig build` 不行**（maker.exe 无法在 D 盘建子进程）。一律用
-  `zig build-exe`/`zig test` 直接调用 + 独立 `ZIG_GLOBAL_CACHE_DIR` + 非沙箱执行。
+- **本地打包/编译一律走打包机 10.0.0.4**（工作目录 `/tmp`，即 `tools/build_remote.py`
+  的 `/tmp/olz-build`）—— 本地性能不行、磁盘不够，**且本机已无 Zig 工具链**
+  （`~/.workbuddy-ai/binaries/` 只有 git/go/node/python）。打包机 Debian 13 x86_64，
+  root/e3eb773F，zig 0.17.0 在 `/root/.cache`（只读用）。**本机产物只能自测，不能当交付。**
+- **Zig 0.17.0 硬下界**；`tools/build_remote.py` 一条命令跑完「上传 → test → 交叉编译 → 取回」。
+- **手拼 JSON 的坑（2026-10-13 踩过）**：`Buf.append` 写**原始字节、不转义**，只有
+  `Buf.print` 才把 `{{`/`}}` 转义成 `{`/`}`。收尾写 `append("}}}")` 会多一个 `}`，
+  整个 body 变非法 JSON；axios 把 `JSON.parse` 失败**静默降级成字符串**，前端只报
+  「获取设置失败： Undefined」。Go 版走 struct/map 序列化天然免疫。**必须靠严格 JSON
+  解析测试兜住**（子串 `indexOf` 测不出；e2e 的 `json.loads` 失败还会静默降级误判成功）。
 - **每个驱动都要有单元测试**（`std.testing.allocator` 抓泄漏）。提交前 `zig test` 和
   交叉编译都要过（`tools/build_remote.py` 走打包机，目标 `aarch64-linux-musl`，加 `-lc -fstrip`）。
 - **D 盘满 → 测试假报 NoSpaceLeft/泄漏**：先看磁盘。清理大头是 `openlist-zig/.zig-cache`
@@ -40,6 +44,24 @@
 - **上游唯一事实来源 = 本地 `D:\workspace\OpenList` 树**（`drivers/<name>/`）。
   不要去 GitHub 拉；`itvsh` 是用户私有驱动，只存在于本地树。
 - **SFTP 驱动（2026-10-11 拍板 defer）**：存档 `docs/FEASIBILITY.md` §5.3，非本轮目标。
+
+## ★ 用户明确要求（2026-10-13，不得再以"简化/体积/困难"为由跳过）
+
+> 我曾把下面几点当成"可接受的简化取舍"并写进文档，被用户明确驳回。详见
+> `openlist-zig/docs/STATUS.md` §11（含进度）。
+
+- **Go 配置必须无缝迁移**：Zig 配置应当是 Go 的**子集**，理论上不该有差异。
+  `tools/import_go_config.py` 现在是有损转换（驱动名映射、丢不支持的驱动、凭据不迁移、
+  settings 落默认值）—— 要重做成**直读** Go 的来源。
+- **允许 SQLite（C 桥接）；没有 1 MB 体积上限；交叉编译不是 Zig 的弱项**
+  （Zig 本身就是 C 交叉编译器）。用"体积/依赖"排除 SQLite 是判断错误，
+  要落地 `libsqlite3` + `aarch64-linux-musl`，直读 Go 的 `data.db`。
+- **核心算法一律对齐 Go，不得自创**：密码哈希（Go `TwoHashPwd` 双层加盐 +
+  `StaticHashSalt="https://github.com/alist-org/alist"` + 每用户 salt；Zig 目前是
+  单层 `sha256`）、签名、JWT claim、时间格式……都要逐函数对照，沿用 189pc 那种
+  **逐字节**验证法。
+- **驱动名映射不是难点**：`factory.key` 逐字节等于 Go `driver.Config.Name`，
+  只是一张确定性对照表；不支持的驱动要给**明确可查询**的理由，不能静默丢弃。
 
 ## 真机部署（光猫 192.168.1.1:10022，隔离目录 `/tmp/olz`）
 

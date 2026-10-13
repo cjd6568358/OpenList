@@ -1,0 +1,128 @@
+#!/bin/sh
+# =============================================================================
+#  /opt/script/openlist_start.sh —— 启动 openlist 文件服务（squashfs 镜像版）
+#
+#  为什么是镜像而不是裸二进制（2026-10-07 落地）：
+#    openlist 未压缩 86,464 KiB，flash 装不下；UPX 版虽然只占 27,178 KiB，
+#    但 UPX stub 会把整个解压体放进【匿名内存】常驻（实测 Rss 102,900 KiB ≈ 100 MiB，
+#    无 swap、不可回收，对 free_est 1:1 扣减）。
+#    squashfs[xz] 把二进制变成【文件页】：按需分页、可回收、Rss 只剩几 MiB，
+#    而且镜像 20,660 KiB 比原来的 UPX 文件还小 6.5 MiB ⇒ flash 与内存双赢。
+#
+#  三件套路径（★ 只有二进制走了镜像，配置和数据全部原地不动）：
+#    镜像  /opt/armbian/bin/openlist/openlist.sqfs   20.2 MiB 只读（xz, -b 1M）
+#    挂载点 /opt/sq/openlist/                        开机挂载，目录是持久的
+#    二进制 /opt/sq/openlist/openlist                挂载后才出现
+#    配置   /opt/armbian/bin/openlist/config.json    ★ 原地不动
+#    数据   /opt/armbian/bin/openlist/data.db        ★ 原地不动
+#    日志   /tmp/openlist.log                        ★ 原地不动（tmpfs，重启即丢）
+#    端口   15244(HTTP) / 15221(FTP) / 15222(SFTP)   ★ 不变
+#
+#  由 /opt/script/user_init.sh 开机调用。幂等：已挂载/已运行都直接跳过。
+#
+# -----------------------------------------------------------------------------
+#  【运维手册】镜像怎么更新 / 怎么回滚
+# -----------------------------------------------------------------------------
+#  ⚠ 三条铁律
+#    1. 镜像【绝不能放 /tmp】：/tmp 是 tmpfs，写多少吃多少 RAM（§6 红线）。
+#    2. 更新必须【先删旧镜像再写新镜像】：flash 只剩 ~18 MiB，装不下
+#       旧(20.2)+新(20.2)=41.2 MiB 两份。
+#    3. 换镜像前必须【先 umount】：loop 设备还占着旧镜像，mv 掉会留下悬空 loop。
+#
+#  ① 编译机（10.0.0.4）打镜像 —— 设备与光猫都没有 mksquashfs，只能在编译机做
+#       mkdir -p /tmp/ol/openlist
+#       cp <新的未压缩 openlist> /tmp/ol/openlist/openlist
+#       mksquashfs /tmp/ol/openlist /tmp/openlist.sqfs -comp xz -b 1M -noappend
+#     ★ 必须 -b 1M：128K 块会比 1M 块大 3.4 MiB（实测 39.68 vs 36.23 MiB）。
+#     ★ 别加 -Xbcj arm：bcj 滤波器对 AArch64 无效。
+#     ★ 镜像内文件名必须是 openlist（挂载点路径依赖它）。
+#
+#  ② 传到设备（Windows 侧执行；MSYS 下传 /tmp 路径要 MSYS_NO_PATHCONV=1）
+#       ssh -p 10022 root@192.168.1.1 "cat > /opt/armbian/bin/openlist/openlist.sqfs.new" < openlist.sqfs
+#     ⚠ 直接写到持久目录，不要中转 /tmp。
+#
+#  ③ 设备侧切换（SSH 进光猫后）
+#       # 1) 停进程：用 exe 路径精确找，别用 cmdline 子串（会匹配到脚本自身）
+#       for p in $(ls /proc | grep -E '^[0-9]+$'); do \
+#         [ "$(readlink /proc/$p/exe)" = "/opt/sq/openlist/openlist" ] && kill $p; done
+#       sleep 2
+#       # 2) 卸载（必须先做，否则 loop 还占着旧镜像）
+#       umount /opt/sq/openlist
+#       # 3) 换镜像
+#       rm -f /opt/armbian/bin/openlist/openlist.sqfs
+#       mv -f /opt/armbian/bin/openlist/openlist.sqfs.new /opt/armbian/bin/openlist/openlist.sqfs
+#       sync
+#       # 4) 起服务（脚本会自己 mount）
+#       /bin/sh /opt/script/openlist_start.sh
+#
+#  ④ 回滚
+#       ★ 设备上【没有】本地回滚副本：改完剩 ~18 MiB < 镜像 20.2 MiB，放不下第二份。
+#       ⇒ 要么从编译机/本地重推旧镜像（编译机 /root/deupx/sq/openlist.sqfs，
+#          本地 C:\workspace\server\f4610u\_work\sq\openlist.sqfs），
+#         按上面的 ②③ 重来一遍；
+#       ⇒ 要么退回 UPX 版：编译机 /root/deupx/openlist_upx 推回
+#         /opt/armbian/bin/openlist/openlist_upx，再把 user_init.sh 第 7 段改回
+#         nohup /opt/armbian/bin/openlist/openlist_upx server --config ... &
+#
+#  ⑤ 排障入口
+#       挂载没成 → grep openlist /proc/mounts ；dmesg | tail -20
+#       起不来   → tail -50 /tmp/openlist.log
+#       冷启动慢 → 正常：首次访问要解压 86 MiB，约 15~25 s；内存紧时 page cache
+#                  留不住会【反复解压】（吃 CPU，但不吃匿名内存 —— 这是设计目标）
+#       看端口   → netstat -ltnp | grep -E '15244|15221|15222'
+# =============================================================================
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+IMG=/opt/armbian/bin/openlist/openlist.sqfs
+MNT=/opt/sq/openlist
+APP=$MNT/openlist
+CONF=/opt/armbian/bin/openlist/config.json
+LOG=/tmp/openlist.log
+
+# ---- 0) 挂载镜像（幂等）----
+#   幂等判断用 /proc/mounts 精确匹配挂载点，不用 mountpoint（busybox 未必有）。
+mkdir -p "$MNT"
+if grep -q " $MNT " /proc/mounts; then
+    echo "[openlist] $MNT already mounted"
+else
+    mount -t squashfs -o loop,ro "$IMG" "$MNT"
+    echo "[openlist] mount rc=$?"
+fi
+
+# ---- 0b) SFTP 爆破守卫（幂等，自带单实例）----
+#   专为本实例服务：Go 版 OpenList 的 SFTP 失败计数 key 是「IP:端口」
+#   （server/sftp.go:96 的 conn.RemoteAddr().String()），每个新连接源端口都不同
+#   ⇒ 自带的 5 次/5 分钟限速永远锁不上，none 认证路径更是没限速（上游 bug），
+#   扫描器字典爆破把 /tmp/openlist.log 刷爆。
+#   本机内核实测无 xt_recent / ipset ⇒ 用 userspace 计数器实现同语义：
+#   同一 IP 1 小时窗口内第 12 次连接尝试起，DROP 其到 :15222 的包，
+#   1 小时到期自动删规则解封；封禁中继续犯则续期 1 小时。
+#   ★ 放在单实例检测【之前】：下面"already running"是 exit 0 早退分支，
+#     晚放会被跳过，openlist 已在跑时重跑本脚本就补不回守卫。
+#   ★ 守卫自身有 pid 文件单实例（/tmp/sftp_guard.pid），重复调用直接退出，
+#     所以本脚本幂等调用它是安全的。
+/bin/sh /opt/armbian/bin/openlist/sftp_guard.sh >>/tmp/sftp_guard.log 2>&1 </dev/null &
+echo "[openlist] sftp_guard rc=$?"
+
+# ---- 1) 单实例检测 ----
+#   ★ 用 readlink /proc/<pid>/exe 精确比对，绝不用 cmdline 子串匹配：
+#     子串匹配会命中本脚本自身的 cmdline（含 openlist_start.sh）导致永不启动
+#     （rtp2httpd_start.sh 2026-10-07 踩过，还误杀了同目录的 mcastcpud）。
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    if [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$APP" ]; then
+        echo "[openlist] already running pid=$p"
+        exit 0
+    fi
+done
+
+# ---- 2) 启动前检查 ----
+if [ ! -x "$APP" ]; then
+    echo "[openlist] ERR: $APP 不存在或不可执行（镜像没挂上？）"
+    echo "[openlist]      grep openlist /proc/mounts 看挂载状态"
+    exit 1
+fi
+[ -f "$CONF" ] || { echo "[openlist] ERR: 配置 $CONF 不存在"; exit 1; }
+
+# ---- 3) 拉起（★ 配置/数据目录全部保持在 /opt/armbian/bin/openlist/）----
+nohup "$APP" server --config "$CONF" >> "$LOG" 2>&1 &
+echo "[openlist] started pid=$!"

@@ -133,7 +133,7 @@ pub const Config = struct {
 
         // 所有权契约：`putZig` **深拷贝**它收下的值。
         //
-        // 调用方（api.handleRegister）用的是 request arena —— 请求一结束那块
+        // 调用方（api.handleInitSetup）用的是 request arena —— 请求一结束那块
         // 内存就被释放，而配置要活到进程结束。以前这里只 dupe 了 key、原样
         // 存 value，于是 `zig.admin_user` / `zig.admin_password_hash` 变成悬空
         // 引用：下一次 `cfg.save()`（改设置、驱动 persist、会话刷新）就会去读
@@ -624,7 +624,7 @@ test "putZig deep-copies out of the request arena" {
     setForTest(cfg);
     defer setForTest(null);
 
-    // 模拟 request arena：handleRegister 就是在这种一次性 arena 上分配
+    // 模拟 request arena：handleInitSetup 就是在这种一次性 arena 上分配
     // 用户名和口令哈希的。
     var req = std.heap.ArenaAllocator.init(testing.allocator);
     const ra = req.allocator();

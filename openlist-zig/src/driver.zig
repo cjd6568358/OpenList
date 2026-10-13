@@ -163,6 +163,72 @@ pub fn persist(storage_id: i64, addition_json: []const u8) void {
     if (persist_hook) |h| h(storage_id, addition_json);
 }
 
+// ---------------------------------------------------------------------------
+// fs bridge —— Strm 驱动回调本实例其他挂载的通道
+// ---------------------------------------------------------------------------
+
+/// Strm（`drivers/strm`）的特殊之处：它不做任何自己的存储 IO，而是把**同一
+/// OpenList 实例里其他挂载**的目录映射成 `.strm` 虚拟文件。Go 侧直接调
+/// `internal/fs`（`fs.List` / `fs.Get`）和 `op.Link` / `common.GetApiUrl` /
+/// `sign.Sign`；本工程的驱动层不能反向依赖 App，所以由 App 在启动时安装
+/// 这组函数指针（`api.installFsBridge`），驱动经全局单例调用。
+pub const FsBridge = struct {
+    ctx: *anyopaque,
+
+    /// Go `fs.Get`：解析虚拟路径到具体挂载并取对象详情。不存在 → error.NotFound。
+    get: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror!File,
+    /// Go `fs.List`（NoLog、按需 Refresh；本实现无缓存层，语义等价）。
+    list: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror![]Obj,
+    /// Go `op.Link`：目标挂载的真实下载链接（不经过 Strm 的 OnlyProxy 包装）。
+    link: *const fn (
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+        args: LinkArgs,
+    ) anyerror!Link,
+    /// Go `sign.Sign(path)`（expire=0，永不过期），secret 用实例 jwt_secret。
+    sign: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror![]const u8,
+    /// Go `common.GetApiUrl(ctx)` 的无请求回退形态：settings 里的 site_url。
+    site_url: *const fn (ctx: *anyopaque) []const u8,
+};
+
+/// 由 `main.zig`（经 `api.installFsBridge`）在 App 构造后安装。为 null 时
+/// Strm 驱动的 list/get 返回 NotFound —— 与 Go 在无存储时 `op.GetStorageAndActualPath`
+/// 失败的行为一致。
+pub var fs_bridge: ?FsBridge = null;
+
+// ---------------------------------------------------------------------------
+// objs-update hook —— Go `op.RegisterObjsUpdateHook` 的对应物
+// ---------------------------------------------------------------------------
+
+/// Go `internal/op/hook.go` 的 `ObjsUpdateHook = func(ctx, parent, objs)`。
+/// 本工程只有 Strm 的 `UpdateLocalStrm` 这一个使用者，所以用单槽而不是列表；
+/// 将来出现第二个钩子再扩成列表。
+pub const ObjsUpdateHook = *const fn (
+    ctx: *anyopaque,
+    alloc: std.mem.Allocator,
+    parent: []const u8,
+    objs: []const Obj,
+) void;
+
+var objs_update_hook: ?struct {
+    func: ObjsUpdateHook,
+    ctx: *anyopaque,
+} = null;
+
+/// 由驱动注册（幂等：后注册者覆盖 —— 本工程只有一个使用者）。
+pub fn registerObjsUpdateHook(func: ObjsUpdateHook, ctx: *anyopaque) void {
+    objs_update_hook = .{ .func = func, .ctx = ctx };
+}
+
+/// Go `op.HandleObjsUpdateHook`。写操作处理层在配置开关
+/// `zig.handle_hook_after_writing`（对齐 Go settings `handle_hook_after_writing`，
+/// 默认 false）打开时调用。
+pub fn notifyObjsUpdate(alloc: std.mem.Allocator, parent: []const u8, objs: []const Obj) void {
+    const h = objs_update_hook orelse return;
+    h.func(h.ctx, alloc, parent, objs);
+}
+
 /// Ergonomic wrapper: `drv.list(ctx, path)` on a concrete `*T`.
 pub fn asDriver(comptime T: type, ptr: *T) Driver {
     return .{ .ptr = ptr, .vtable = &T.vtable };
@@ -216,6 +282,7 @@ pub const builtin = [_]Factory{
     @import("drivers/quarkuc.zig").factory, // Quark（Cookie）
     @import("drivers/pan115.zig").factory, // 115 Cloud（Cookie）
     @import("drivers/wopan.zig").factory, // WoPan（联通沃云盘，refresh_token）
+    @import("drivers/strm.zig").factory, // Strm（把其他挂载映射成 .strm，2026-10-14）
 
     // ---------------------------------------------------------------------
     // 暂时下线的入口 —— 这几个是**做错了变体**的驱动，代码保留、不删，

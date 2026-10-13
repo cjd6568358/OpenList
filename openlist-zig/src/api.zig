@@ -6,7 +6,8 @@
 //!   GET  /ping                         liveness
 //!   GET  /api/public/settings          site config + whether setup is done
 //!   POST /api/auth/login               -> JWT
-//!   POST /api/auth/register            first-run admin creation only
+//!   GET  /api/public/init_status       whether the system is initialised
+//!   POST /api/public/init/setup        first-run admin creation
 //!   POST /api/fs/list                  browse a directory
 //!   POST /api/fs/get                   stat a path
 //!   POST /api/fs/dirs                  list mount points
@@ -72,8 +73,12 @@ pub const App = struct {
     /// 0.17：`std.Thread.Mutex` 并入 `std.Io.Mutex`，lock/unlock 都要 io。
     mounts_lock: std.Io.Mutex = .init,
     mounts: []Mount,
-    /// SHA-256 hex of the admin password. Empty means "run the setup flow".
+    /// `sha256(sha256(pw + "-" + StaticHashSalt) + "-" + salt)` —— 与 Go
+    /// `User.PwdHash` 同形（`model.TwoHashPwd`）。空 = 还没建管理员。
     admin_hash: []const u8,
+    /// 每用户随机 salt（Go `User.Salt`）；没有它就算不出 PwdHash。
+    /// 给默认值是为了让那些只关心路由的测试构造（`App{...}`）不必逐个补字段。
+    admin_salt: []const u8 = "",
     admin_user: []const u8,
     /// A03：口令版本时间戳。签发令牌时写进 claim，校验时比对；改密就把它推到
     /// 当前时间，于是所有旧令牌立刻失效。对应 Go 的 `model.User.PwdTS`
@@ -96,6 +101,7 @@ pub const App = struct {
             .mounts = &.{},
             .admin_hash = try readSecret(alloc, cfg, "admin_password_hash"),
             .admin_user = try readSecretDefault(alloc, cfg, "admin_user", "admin"),
+            .admin_salt = try readSecret(alloc, cfg, "admin_salt"),
             .admin_pwd_ts = readSecretInt(cfg, "admin_pwd_ts", 0),
             .jwt_secret = try alloc.dupe(u8, cfg.jwt_secret),
             .site_url = try alloc.dupe(u8, cfg.site_url),
@@ -122,11 +128,51 @@ pub const App = struct {
         return app;
     }
 
+    /// 从磁盘重读 config.json，只把管理员凭据（user / hash / pwd_ts）换成新值。
+    ///
+    /// 供 `/api/admin/user/del_cache` 用：CLI（`openlist admin set` / `admin random`）
+    /// 是**独立进程**，它只写配置文件；在线服务的凭据是启动时读进内存的副本，
+    /// 不重载的话改完密码旧令牌照样能用。对齐 Go 的 `DelAdminCacheOnline`
+    /// （`cmd/user.go:15`：改完库再 HTTP 通知在线服务清缓存）。
+    pub fn reloadAdminCredentials(self: *App) !void {
+        const cfg = config.get();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = try std.Io.Dir.cwd().readFileAlloc(rt.io(), cfg.path, a, .limited(8 * 1024 * 1024));
+        const doc = try json.parse(a, text);
+        const zig = doc.getPath("zig") orelse return error.MalformedConfig;
+
+        const user = if (zig.getPath("admin_user")) |v| (v.asStr() orelse "admin") else "admin";
+        const salt = if (zig.getPath("admin_salt")) |v| (v.asStr() orelse "") else "";
+        const hash = if (zig.getPath("admin_password_hash")) |v| (v.asStr() orelse "") else "";
+        const pwd_ts = if (zig.getPath("admin_pwd_ts")) |v| (v.asInt() orelse 0) else 0;
+
+        self.admin_user = try self.alloc.dupe(u8, user);
+        self.admin_salt = try self.alloc.dupe(u8, salt);
+        self.admin_hash = try self.alloc.dupe(u8, hash);
+        self.admin_pwd_ts = pwd_ts;
+    }
+
     /// Releases the frontend arena. The remaining fields are process-lifetime
     /// and are deliberately not tracked; this exists so the largest single
     /// allocation is still accounted for when the server shuts down.
     pub fn deinit(self: *App) void {
         self.frontend.deinit();
+    }
+
+    /// Strm 驱动的 fs 回调桥（Go 侧直接调 `internal/fs` + `op.Link` +
+    /// `sign.Sign` + `common.GetApiUrl`）。在 `main.zig` 的 App 构造后调用；
+    /// 测试里也可以对局部 App 调用（bridge 只借 ctx 指针，不持有）。
+    pub fn installFsBridge(self: *App) void {
+        driver.fs_bridge = .{
+            .ctx = self,
+            .get = bridgeGet,
+            .list = bridgeList,
+            .link = bridgeLink,
+            .sign = bridgeSign,
+            .site_url = bridgeSiteUrl,
+        };
     }
 
     /// T6：取当前 mounts 快照。只锁「拷 slice 头」这一下，绝不拿着锁做别的。
@@ -180,6 +226,70 @@ pub const App = struct {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Strm 的 fs 桥实现（Go `internal/fs` 的最小等价面）。
+fn bridgeCtx(ctx: *anyopaque) *App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn bridgeGet(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) !driver.File {
+    const app = bridgeCtx(ctx);
+    const r = app.resolve(path) orelse return error.NotFound;
+    var c = driver.Ctx{ .alloc = alloc, .tag = r.mount.mount_path };
+    return r.mount.driver.details(&c, r.rel);
+}
+
+fn bridgeList(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) ![]model.Obj {
+    const app = bridgeCtx(ctx);
+    const r = app.resolve(path) orelse return error.NotFound;
+    var c = driver.Ctx{ .alloc = alloc, .tag = r.mount.mount_path };
+    return r.mount.driver.list(&c, r.rel);
+}
+
+fn bridgeLink(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8, args: driver.LinkArgs) !driver.Link {
+    const app = bridgeCtx(ctx);
+    const r = app.resolve(path) orelse return error.NotFound;
+    var c = driver.Ctx{ .alloc = alloc, .tag = r.mount.mount_path };
+    return r.mount.driver.link(&c, r.rel, args);
+}
+
+fn bridgeSign(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const app = bridgeCtx(ctx);
+    // Go `sign.Sign(path)` = SignWithExpire(path, 0)（永不过期）。
+    return signValue(alloc, app.jwt_secret, path, 0);
+}
+
+fn bridgeSiteUrl(ctx: *anyopaque) []const u8 {
+    return bridgeCtx(ctx).site_url;
+}
+
+/// 取虚拟路径的父目录（Go `stdpath.Dir`）。
+fn dirnameRel(path: []const u8) []const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "/";
+    if (idx == 0) return "/";
+    return path[0..idx];
+}
+
+/// Go `internal/op/hook.go` 的写后钩子开关：settings 表的
+/// `handle_hook_after_writing`（默认 false）。本工程没有 settings 表，
+/// 落到 `zig.handle_hook_after_writing`。
+fn hookAfterWritingEnabled() bool {
+    const cfg = config.getOpt() orelse return false;
+    const v = cfg.raw("zig.handle_hook_after_writing") orelse return false;
+    const s = v.asStr() orelse return false;
+    return std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1");
+}
+
+/// Go `op.objsUpdateHook`：写操作成功后重列目标目录并广播。
+/// 失败只记日志 —— 钩子永远不能让写操作本身报错（Go 在 goroutine 里做）。
+fn notifyObjsUpdateAfterWrite(app: *App, a: std.mem.Allocator, mount: *Mount, parent_rel: []const u8) void {
+    _ = app;
+    if (!hookAfterWritingEnabled()) return;
+    var c = driver.Ctx{ .alloc = a, .tag = mount.mount_path };
+    const objs = mount.driver.list(&c, parent_rel) catch return;
+    const parent = urlmod.joinPath(a, if (std.mem.eql(u8, mount.mount_path, "/")) "" else mount.mount_path, parent_rel) catch return;
+    driver.notifyObjsUpdate(a, parent, objs);
+}
+
 pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // CORS preflight, so the frontend can be served from another origin.
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
@@ -199,9 +309,21 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
 
     if (std.mem.eql(u8, p, "/ping")) return handlePing(res);
     if (std.mem.eql(u8, p, "/api/public/settings")) return handlePublicSettings(app, res);
+    // Go 路由把这个接口放在 public 组；即使 Zig 当前没有离线下载任务管理器，
+    // 也必须返回成功的空工具列表，不能把前端能力探测打成 404。
+    if (std.mem.startsWith(u8, p, "/api/public/offline_download_tools")) return res.jsonOk("[]");
     if (std.mem.eql(u8, p, "/api/public/archive_extensions")) return res.jsonOk("[\"zip\",\"tar\"]");
+    // Go 用 `/public/init_status` + `/public/init/setup` 做首次安装向导
+    // （server/router.go:105-106），**没有** `/auth/register`。前端 App.tsx
+    // 靠 `init_status` 决定是否跳 `/@init`，缺了它永远不会引导注册。
+    if (std.mem.eql(u8, p, "/api/public/init_status")) return handleInitStatus(app, req, res);
+    if (std.mem.eql(u8, p, "/api/public/init/setup")) return handleInitSetup(app, req, res);
     if (std.mem.eql(u8, p, "/api/auth/login")) return handleLogin(app, req, res);
-    if (std.mem.eql(u8, p, "/api/auth/register")) return handleRegister(app, req, res);
+    if (std.mem.eql(u8, p, "/api/auth/login/hash")) return handleLoginHash(app, req, res);
+    // ⚠️ Go **没有** `/api/auth/register` —— `server/router.go` 的 public 组只有
+    // settings / archive_extensions / init_status / init/setup。这里曾自造过一个，
+    // 现已删除：首次建管理员走 `/api/public/init/setup`，忘记密码走 CLI
+    // `openlist admin set NEW_PASSWORD` / `admin random`（见 docs/STATUS.md §11）。
 
     // ---- frontend -------------------------------------------------------
     //
@@ -224,6 +346,12 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // Only the known authenticated prefixes reach `handleAuthed`; any other
     // /api/* path falls through to the 404 catch-all below (matching upstream,
     // which answers an unregistered API route with JSON 404, not 401).
+    // CLI（`openlist admin set/random`）改完配置文件后调它做热重载。它用
+    // `zig.token`（`openlist admin token` 可查）认证、**不是** JWT，所以必须
+    // 拦在 `handleAuthed` 前面 —— 对齐 Go：`cmd/user.go:DelUserCacheOnline`
+    // 也是拿 settings 表的 token 去 POST `/api/admin/user/del_cache`。
+    if (std.mem.eql(u8, p, "/api/admin/user/del_cache")) return handleDelUserCache(app, req, res);
+
     if (std.mem.startsWith(u8, p, "/api/fs/")) return handleAuthed(app, req, res);
     if (std.mem.eql(u8, p, "/api/me")) return handleAuthed(app, req, res);
     if (std.mem.startsWith(u8, p, "/api/admin/")) return handleAuthed(app, req, res);
@@ -351,57 +479,222 @@ fn handlePing(res: *http.Response) !void {
 // Public settings / auth
 // ---------------------------------------------------------------------------
 
+/// Go `db.GetPublicSettingItems()` 返回的是 `flag IN (PUBLIC, READONLY)` 的项
+/// （`internal/db/settingitem.go:34`），默认值全部取自 `InitialSettings()`
+/// （`internal/bootstrap/data/setting.go`）。本工程没有 settings 数据库，所以这里
+/// 内联同一张表：**键名与默认值照抄 Go**，其中 4 项改从实时 settings 读
+/// （见 `publicSettingValue`），可被 `/api/admin/setting` 改写。
+///
+/// ⚠️ 值一律是**字符串**。Go 返回 `map[string]string`，前端用
+/// `t === 'true' || t === '1'` 判布尔、`Number(t)` 判数字 —— 给原生 bool/int
+/// 会让判断恒为 false（`true === 'true'` 不成立），页面静默走错分支。
+const PublicSetting = struct { key: []const u8, value: []const u8 };
+
+/// 与 `main.version` 保持一致（api.zig 不能 import main.zig —— 会成环）。
+const server_version = "0.1.0-zig";
+
+const public_setting_defaults = [_]PublicSetting{
+    // ---- SITE ----
+    .{ .key = "version", .value = "" }, // 由 publicSettingValue 填
+    .{ .key = "site_title", .value = "OpenList" },
+    .{ .key = "announcement", .value = "" },
+    .{ .key = "pagination_type", .value = "all" },
+    .{ .key = "default_page_size", .value = "30" },
+    .{ .key = "allow_indexed", .value = "false" },
+    .{ .key = "allow_mounted", .value = "true" },
+    .{ .key = "robots_txt", .value = "User-agent: *\nAllow: /" },
+    // ---- STYLE ----
+    .{ .key = "logo", .value = "https://res.oplist.org/logo/logo.svg" },
+    .{ .key = "favicon", .value = "https://res.oplist.org/logo/logo.svg" },
+    .{ .key = "main_color", .value = "#1890ff" },
+    .{ .key = "home_icon", .value = "🏠" },
+    .{ .key = "share_icon", .value = "🎁" },
+    .{ .key = "home_container", .value = "max_980px" },
+    .{ .key = "settings_layout", .value = "list" },
+    .{ .key = "show_disk_usage_in_plain_text", .value = "false" },
+    // ---- PREVIEW ----
+    .{ .key = "external_previews", .value = "{}" },
+    .{ .key = "iframe_previews", .value =
+        \\{"doc,docx,xls,xlsx,ppt,pptx":{"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$e_url","Google":"https://docs.google.com/gview?url=$e_url&embedded=true"},"pdf":{"PDF.js":"https://res.oplist.org/pdf.js/web/viewer.html?file=$e_url"},"epub":{"EPUB.js":"https://res.oplist.org/epub.js/viewer.html?url=$e_url"}}
+    },
+    .{ .key = "audio_cover", .value = "https://res.oplist.org/logo/logo.svg" },
+    .{ .key = "audio_autoplay", .value = "true" },
+    .{ .key = "video_autoplay", .value = "true" },
+    .{ .key = "preview_download_by_default", .value = "false" },
+    .{ .key = "preview_archives_by_default", .value = "true" },
+    .{ .key = "share_preview_download_by_default", .value = "true" },
+    .{ .key = "share_preview_archives_by_default", .value = "false" },
+    .{ .key = "readme_autorender", .value = "true" },
+    .{ .key = "filter_readme_scripts", .value = "true" },
+    .{ .key = "non_efs_zip_encoding", .value = "IBM437" },
+    // ---- GLOBAL ----
+    .{ .key = "hide_files", .value = "/\\/README.md/i" },
+    .{ .key = "package_download", .value = "true" },
+    .{ .key = "ocr_api", .value = "https://openlistteam-ocr-api-server.hf.space/ocr/file/json" },
+    .{ .key = "filename_char_mapping", .value = "{\"/\": \"|\"}" },
+    .{ .key = "forward_direct_link_params", .value = "false" },
+    .{ .key = "ignore_direct_link_params", .value = "sign,openlist_ts,raw" },
+    .{ .key = "webauthn_login_enabled", .value = "false" },
+    .{ .key = "share_preview", .value = "false" },
+    .{ .key = "share_archive_preview", .value = "false" },
+    .{ .key = "share_summary_content", .value =
+        \\@{{creator}} shared {{#each files}}{{#if @first}}"{{filename this}}"{{/if}}{{#if @last}}{{#unless (eq @index 0)}} and {{@index}} more files{{/unless}}{{/if}}{{/each}} from {{site_title}}: {{base_url}}/@s/{{id}}{{#if pwd}} , the share code is {{pwd}}{{/if}}{{#if expires}}, please access before {{dateLocaleString expires}}.{{/if}}
+    },
+    // ---- INDEX ----
+    .{ .key = "search_index", .value = "none" },
+    .{ .key = "auto_update_index", .value = "false" },
+    // ---- SSO ----
+    .{ .key = "sso_login_enabled", .value = "false" },
+    .{ .key = "sso_login_platform", .value = "" },
+    .{ .key = "sso_compatibility_mode", .value = "false" },
+    // ---- LDAP ----
+    .{ .key = "ldap_login_enabled", .value = "false" },
+    .{ .key = "ldap_login_tips", .value = "login with ldap" },
+    // ---- TRAFFIC ----
+    .{ .key = "multipart_enabled", .value = "true" },
+    .{ .key = "multipart_chunk_size", .value = "10" },
+};
+
+/// 4 个键有实时来源（`/api/admin/setting` 改得动），其余走表里的默认值。
+/// 读 `app.frontend.settings` 而不是 `config.get()`：前者由 `App` 持有、
+/// 测试里无需初始化 config 单例，且 PUT 处理器会同时更新两者。
+fn publicSettingValue(app: *const App, item: PublicSetting) []const u8 {
+    const s = app.frontend.settings;
+    if (std.mem.eql(u8, item.key, "version")) return server_version;
+    if (std.mem.eql(u8, item.key, "site_title")) return s.site_title;
+    if (std.mem.eql(u8, item.key, "logo")) return s.logo;
+    if (std.mem.eql(u8, item.key, "favicon")) return s.favicon;
+    if (std.mem.eql(u8, item.key, "main_color")) return s.main_color;
+    return item.value;
+}
+
+/// `GET /api/public/settings` —— 对齐 Go `handles.PublicSettings`
+/// （`server/handles/setting.go:145` → `op.GetPublicSettingsMap()`）。
+/// 之前只返回 10 个自造字段（`initial_done`/`api`/`cdn`/`token_expires_in`…），
+/// 前端真正读的 30 多个键一个都没有 —— 表现就是首页 `logo` 拿到空串、
+/// `<img src="">`。现在按 Go 的字段集补齐。
 fn handlePublicSettings(app: *App, res: *http.Response) !void {
     const a = res.arena;
     var b = Buf.init(a);
-    try b.print("{{\"code\":200,\"message\":\"success\",\"data\":{{", .{});
-    try b.append("\"site_title\":");
-    try json.writeString(&b, app.frontend.settings.site_title);
-    try b.append(",");
-    try b.print("\"version\":\"0.1.0-zig\",", .{});
-    try b.print("\"api\":\"v2\",", .{});
-    // The frontend keys off this to decide whether to show the setup wizard.
-    try b.print("\"initial_done\":{s},", .{if (app.admin_hash.len > 0) "true" else "false"});
-    try b.print("\"allow_indexed\":false,\"allow_mounted\":false,\"enable_search\":false,", .{});
-    try b.print("\"enable_register\":{s},", .{if (app.admin_hash.len > 0) "false" else "true"});
-    try b.print("\"site_url\":", .{});
-    try json.writeString(&b, app.site_url);
-    try b.append(",\"cdn\":");
-    try json.writeString(&b, app.cdn);
-    try b.print(",\"token_expires_in\":{d}", .{app.token_expires_in_hours});
-    try b.append("}}}");
+    try b.append("{\"code\":200,\"message\":\"success\",\"data\":{");
+    for (public_setting_defaults, 0..) |item, i| {
+        if (i != 0) try b.appendByte(',');
+        try json.writeString(&b, item.key);
+        try b.appendByte(':');
+        try json.writeString(&b, publicSettingValue(app, item));
+    }
+    // `append` 写原始字节，不做 `print` 那样的 `{{`/`}}` 转义 —— 这里必须是
+    // "}}"（关闭 data 与信封）。曾误写成 "}}}"，多出的 `}` 让整个 body 非法，
+    // axios 静默把 JSON.parse 失败降级成字符串，前端只报「获取设置失败： Undefined」。
+    try b.append("}}");
     try res.jsonOkRaw(b.slice());
 }
 
-fn handleRegister(app: *App, req: *http.Request, res: *http.Response) !void {
-    if (app.admin_hash.len > 0) return res.jsonError(409, "administrator already exists");
+/// `GET /api/public/init_status` —— 对齐 Go `server/handles/setup.go:15`
+/// （`server/router.go:105` 注册为 `Any`）。
+///
+/// 前端 `App.tsx` 靠它决定是否跳 `/@init` 安装向导：
+///   `if (initialized() === false && !pathname().startsWith("/@init")) to("/@init")`
+/// 而这个请求的**失败回调在源码里被注释掉了**（静默吞错），`initialized` 于是
+/// 保持 `createSignal(true)` 的默认值 —— 端点缺失（404）时前端**永远不会**引导
+/// 注册，表现就是"没有注册入口，只能用已有账号登录"。
+fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
+    if (!std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "POST")) {
+        return res.jsonError(405, "method not allowed");
+    }
+    // Go 的判据是"管理员是否已存在"（`op.GetAdmin()` 取不到记录 ⇒ 未初始化）。
+    try res.jsonOk(if (app.admin_hash.len > 0) "{\"initialized\":true}" else "{\"initialized\":false}");
+}
+
+/// `POST /api/public/init/setup` —— 对齐 Go `server/handles/setup.go:37`。
+/// 只在未初始化时可调；成功后**不签发 token**（Go 只回 `data:null`，前端注册完
+/// 会自己再走一次登录）。
+fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
+    if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
+    // 已初始化 ⇒ 拒绝（Go：`system has already been initialized`）。
+    if (app.admin_hash.len > 0) return res.jsonError(400, "system has already been initialized");
+
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const username = v.strAt("username") orelse "";
     const password = v.strAt("password") orelse "";
-    if (username.len == 0 or password.len < 6) {
-        return res.jsonError(400, "username required and password must be at least 6 characters");
+    if (username.len == 0 or password.len == 0) {
+        return res.jsonError(400, "username and password are required");
     }
-    const hash = try sha256Hex(a, password);
+    // Go 这里是 `< 4`（setup.go:56），比 `/auth/register` 的 6 更宽松 —— 逐字对齐。
+    if (password.len < 4) return res.jsonError(400, "password must be at least 4 characters");
+
     const cfg = config.get();
-    // `putZig` 现在深拷贝到配置 arena，所以这里可以直接交出 request arena
-    // 上的 `username` / `hash`，不必先 dupe 一份（以前 dupe 了也没用 ——
-    // putZig 存的是引用，那份 dupe 随请求一起释放）。
-    try cfg.putZig("admin_user", .{ .string = username });
+    const ca = cfg.allocator();
+    // 对齐 Go `User.SetPassword`（internal/model/user.go:96）：现生成 16 位 salt，
+    // 存的是 `TwoHashPwd(pwd, salt)` —— 不是裸 sha256。前端登录页发的是
+    // `StaticHash(pwd)`，服务端再套一层 `HashPwd(·, salt)` 比对，所以缺了 salt
+    // 这一层就永远对不上。
+    const salt = try randomSalt(ca);
+    const hash = try twoHashPwd(ca, password, salt);
+    try cfg.putZig("admin_user", .{ .string = try ca.dupe(u8, username) });
+    try cfg.putZig("admin_salt", .{ .string = salt });
     try cfg.putZig("admin_password_hash", .{ .string = hash });
-    cfg.save() catch |e| {
-        log.warn("api: could not persist admin credentials: {s}", .{@errorName(e)});
-    };
-    app.admin_user = try app.alloc.dupe(u8, username);
-    app.admin_hash = try app.alloc.dupe(u8, hash);
-    // 首次注册就是"口令版本 1"：把时间戳立起来，签发的令牌才会带上它。
+    // 口令版本：让随后签发的令牌带上它（改密/重置时推进即可失效旧令牌）。
     app.admin_pwd_ts = rt.nowSeconds();
     try cfg.putZig("admin_pwd_ts", .{ .int = app.admin_pwd_ts });
-    log.info("api: administrator {s} created", .{username});
-    return issueToken(app, a, res, username);
+    // 可选的站点名（Go：`if req.SiteTitle != ""` 才写）。
+    if (v.strAt("site_title")) |title| {
+        if (title.len > 0) {
+            const owned = try ca.dupe(u8, title);
+            cfg.site_title = owned;
+            try cfg.putZig("site_title", .{ .string = owned });
+        }
+    }
+    cfg.save() catch |e| {
+        log.warn("api: could not persist init setup: {s}", .{@errorName(e)});
+        return res.jsonError(500, "could not save setup");
+    };
+    app.admin_user = try app.alloc.dupe(u8, username);
+    app.admin_salt = try app.alloc.dupe(u8, salt);
+    app.admin_hash = try app.alloc.dupe(u8, hash);
+    app.frontend.settings.site_title = try app.alloc.dupe(u8, cfg.site_title);
+    log.info("api: initialised by {s}", .{username});
+    try res.jsonOk("null");
 }
 
+/// `POST /api/admin/user/del_cache` —— 对齐 Go `server/handles/user.go`
+/// （路由见 `server/router.go:136`），由 CLI 在改完管理员凭据后调用，让在线
+/// 服务丢掉内存里的凭据副本、无需重启。认证用 `zig.token`
+/// （`openlist admin token` 可查看），语义对齐 Go 用 settings 表里的 token。
+fn handleDelUserCache(app: *App, req: *http.Request, res: *http.Response) !void {
+    if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
+    const cfg = config.get();
+    const expected = if (cfg.raw("zig.token")) |v| (v.asStr() orelse "") else "";
+    const given = req.header("Authorization") orelse "";
+    if (expected.len == 0 or !std.mem.eql(u8, expected, given)) {
+        return res.jsonError(401, "invalid token");
+    }
+    app.reloadAdminCredentials() catch |e| {
+        log.warn("api: del_cache could not reload config: {s}", .{@errorName(e)});
+        return res.jsonError(500, "could not reload config");
+    };
+    log.info("api: admin credentials reloaded from config (del_cache)", .{});
+    try res.jsonOk("null");
+}
+
+/// `POST /api/auth/login` —— 收**明文**口令（Go 里标了 Deprecated 但仍可用）。
 fn handleLogin(app: *App, req: *http.Request, res: *http.Response) !void {
+    return loginCommon(app, req, res, false);
+}
+
+/// `POST /api/auth/login/hash` —— **前端登录页实际调用的就是这个**
+/// （`server/router.go:75` → `handles.LoginHash`）。body 里的 `password`
+/// 已经是 `StaticHash(明文)`，服务端只需再套一层 `HashPwd(·, salt)` 比对。
+///
+/// ⚠️ 这个端点曾经缺失，导致前端登录恒失败 —— curl 直接打 `/auth/login`
+/// 是通的，所以「用 curl 验证过」并不等于「前端能登录」。
+fn handleLoginHash(app: *App, req: *http.Request, res: *http.Response) !void {
+    return loginCommon(app, req, res, true);
+}
+
+/// `already_static` = 收到的 password 是否已经过 `StaticHash`。
+fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_static: bool) !void {
     if (app.admin_hash.len == 0) return res.jsonError(400, "no administrator yet; run setup first");
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
@@ -410,10 +703,14 @@ fn handleLogin(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, username, app.admin_user)) {
         return res.jsonError(400, "wrong username or password");
     }
-    const hash = try sha256Hex(a, password);
+    // Go `User.ValidatePwd` / `ValidatePwdStaticHash`（internal/model/user.go:83-94）：
+    //     PwdHash == HashPwd(<static hash>, Salt)
+    // 明文接口先做一次 StaticHash；`/login/hash` 直接拿收到的 static hash 用。
+    const static = if (already_static) password else try staticHash(a, password);
+    const expect = try hashPwd(a, static, app.admin_salt);
     // Constant-time compare. A plain `std.mem.eql` would leak the position of
     // the first differing byte; a length check first would leak the length.
-    if (!ctEqual(hash, app.admin_hash)) {
+    if (!ctEqual(expect, app.admin_hash)) {
         return res.jsonError(400, "wrong username or password");
     }
     return issueToken(app, a, res, username);
@@ -561,8 +858,21 @@ fn handleFsList(app: *App, req: *http.Request, res: *http.Response) !void {
     }
     try b.append("],\"total\":");
     try b.print("{d}", .{objs.len});
-    try b.append("}}");
+    try appendFsListTail(&b);
     try res.jsonOkRaw(b.slice());
+}
+
+/// `FsListResp` 的尾部字段 —— Go `server/handles/fsread.go:49-58`。
+/// **不能省**：前端 store 用 `setWrite(e.write)` 决定是否渲染上传/新建/删除按钮，
+/// 字段缺失会让 `write` 变 `undefined`、目录被判成只读（按钮整片消失）。
+///   * `readme` / `header` —— 来自 meta；本工程没有 meta，恒空串；
+///   * `write` —— 单管理员构建，认证用户一律可写；
+///   * `write_content_bypass` —— 无 meta 权限模型，恒 false；
+///   * `provider` —— Go 侧也是硬编码 `"unknown"`（fsread.go:110 赋值后再没改过）；
+///   * `direct_upload_tools` —— Go 标了 `omitempty`，驱动未实现 `DirectUploader`
+///     就不发这个键，这里同样省略。
+fn appendFsListTail(b: *Buf) !void {
+    try b.append(",\"readme\":\"\",\"header\":\"\",\"write\":true,\"write_content_bypass\":false,\"provider\":\"unknown\"}}");
 }
 
 /// The virtual root shows one entry per mount, exactly like OpenList.
@@ -575,13 +885,15 @@ fn listRoot(app: *App, res: *http.Response) !void {
         if (i != 0) try b.appendByte(',');
         try b.append("{\"name\":");
         try json.writeString(&b, std.mem.trim(u8, m.mount_path, "/"));
-        try b.append(",\"size\":0,\"is_dir\":true,\"modified\":\"\",\"created\":\"\"");
+        // Go 的 time.Time 零值 JSON 是 RFC3339 的 year-1，而不是空串；空串
+        // 进入前端 `new Date(...).getTime()` 就会变成 NaN。
+        try b.append(",\"size\":0,\"is_dir\":true,\"modified\":\"0001-01-01T00:00:00Z\",\"created\":\"0001-01-01T00:00:00Z\"");
         // 挂载点都是目录 → Go 的 FOLDER = 1（以前这里写的是自造的 2）。
         try b.append(",\"sign\":\"\",\"thumb\":\"\",\"type\":1,\"hash_info\":null}");
     }
     try b.append("],\"total\":");
     try b.print("{d}", .{mounts.len});
-    try b.append("}}");
+    try appendFsListTail(&b);
     try res.jsonOkRaw(b.slice());
 }
 
@@ -590,9 +902,25 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     const v = try parseBodyJson(a, req, res) orelse return;
     const path = v.strAt("path") orelse "/";
 
+    // 对齐 Go `internal/fs/get.go:25-30`：`/` 不属于任何挂载，但 Go 对它返回一个
+    // **虚拟根对象**（`name:"root", is_dir:true, Mask:ReadOnly|Virtual`），而不是
+    // "storage not found"。前端 Layout 进首页第一个请求就是 `fs/get /`，此前这里
+    // 回了 404，首页直接显示 404（管理后台走的是 storage/list 所以看起来正常）。
+    // provider 也对齐 Go：虚拟根取不到 storage ⇒ 空串（fsread.go:309-311 的
+    // `!ok && err == nil` 分支不成立）。
+    if (std.mem.eql(u8, path, "/")) {
+        return res.jsonOk("{\"name\":\"root\",\"size\":0,\"is_dir\":true,\"modified\":\"0001-01-01T00:00:00Z\",\"created\":\"0001-01-01T00:00:00Z\",\"sign\":\"\",\"thumb\":\"\",\"type\":1,\"hash_info\":null,\"raw_url\":\"\",\"readme\":\"\",\"header\":\"\",\"provider\":\"\",\"related\":[]}");
+    }
+
     const r = app.resolve(path) orelse return res.jsonError(404, "storage not found");
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
     const f = r.mount.driver.details(&ctx, r.rel) catch |e| return mapDriverError(res, e);
+
+    // 与 Go `server/common/sign.go` 一致：目录 sign 为空串；文件在
+    // `sign_all` 开（或 meta 加密）时签完整路径。fs/get 的 `sign` 字段与
+    // raw_url 上带的 `?sign=` 必须是同一个值 —— 前端音频/视频播放器直接用
+    // raw_url，不带 sign 的 `/p` 在 sign_all 部署下会被 401（实测踩过）。
+    const sign_val = try signForObj(app, a, f.is_dir, path);
 
     var raw_url: []const u8 = "";
     if (!f.is_dir) {
@@ -605,10 +933,18 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
         // 与 Go `server/handles/fsread.go:318-339` 一致：需要服务端代理的
         // （或本地文件）给出本站 `/p` 可鉴权 URL，不能把带 Cookie 才能用的
         // CDN 地址直接丢给浏览器；只有真正可直链的才回上游 URL。
-        raw_url = if (lk.proxy or lk.local_path != null)
-            try std.fmt.allocPrint(a, "/p{s}", .{path})
-        else
-            lk.url;
+        // 带 sign 的方式对齐 Go `common.GenerateDownProxyURL`
+        // （server/common/proxy.go:31-33：`?sign=` + `sign.Sign(reqPath)`）；
+        // 路径编码对齐 `utils.EncodePath(reqPath, true)`（`.path` 保留 `/`）。
+        if (lk.proxy or lk.local_path != null) {
+            const enc = try urlmod.encode(a, path, .path);
+            raw_url = if (sign_val.len == 0)
+                try std.fmt.allocPrint(a, "/p{s}", .{enc})
+            else
+                try std.fmt.allocPrint(a, "/p{s}?sign={s}", .{ enc, sign_val });
+        } else {
+            raw_url = lk.url;
+        }
     }
 
     var b = Buf.init(a);
@@ -619,19 +955,25 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     try b.append(",\"modified\":");
     try json.writeString(&b, try fmtTime(a, f.modified));
     try b.append(",\"created\":");
-    try json.writeString(&b, try fmtTime(a, f.created));
+    try json.writeString(&b, try fmtTime(a, if (f.created == 0) f.modified else f.created));
     try b.append(",\"sign\":");
     // 对齐 Go `server/common/sign.go`：非目录且 `sign_all` 开时给一个可拼到
     // `/p`、`/d` 后的下载签名（否则空串）。此前这里透传驱动给的 `f.sign`
     // （恒为空），前端拿到的是空 sign，`sign_all=true` 的部署下点不开文件。
-    try json.writeString(&b, try signForObj(app, a, f.is_dir, path));
+    try json.writeString(&b, sign_val);
     try b.append(",\"type\":");
     // A06：按 Go 的 `GetObjType` 输出（FOLDER=1、VIDEO=2、AUDIO=3、TEXT=4、
     // IMAGE=5），不再是自造的 file=1/folder=2。
     try b.print("{d}", .{@backingInt(model.objTypeFor(f.name, f.is_dir))});
     try b.append(",\"raw_url\":");
     try json.writeString(&b, raw_url);
-    try b.append(",\"readme\":\"\",\"provider\":\"\"}}");
+    // Go 的 `FsGetResp` = `ObjResp` + raw_url/readme/header/provider/related
+    // （server/handles/fsread.go:249-255）。`provider` 取驱动名 —— 对齐
+    // fsread.go:309-311（`model.GetProvider` 拿不到就回落 `storage.Config().Name`）。
+    // header/related 前端当前不读，一并补齐，免得再漏。
+    try b.append(",\"readme\":\"\",\"header\":\"\",\"provider\":");
+    try json.writeString(&b, r.mount.storage.driver);
+    try b.append(",\"related\":[]}}");
     try res.jsonOkRaw(b.slice());
 }
 
@@ -664,6 +1006,7 @@ fn handleFsCopy(app: *App, req: *http.Request, res: *http.Response) !void {
         if (sr.mount != dr.mount) return res.jsonError(400, "copying between storages is not supported yet");
         var ctx = driver.Ctx{ .alloc = a, .tag = sr.mount.mount_path };
         sr.mount.driver.copy(&ctx, sr.rel, dr.rel) catch |e| return mapDriverError(res, e);
+        notifyObjsUpdateAfterWrite(app, a, dr.mount, dst_dir);
     }
     try res.jsonOk("null");
 }
@@ -676,6 +1019,7 @@ fn handleFsRename(app: *App, req: *http.Request, res: *http.Response) !void {
     const r = app.resolve(path) orelse return res.jsonError(404, "storage not found");
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
     r.mount.driver.rename(&ctx, r.rel, name) catch |e| return mapDriverError(res, e);
+    notifyObjsUpdateAfterWrite(app, a, r.mount, dirnameRel(path));
     try res.jsonOk("null");
 }
 
@@ -697,6 +1041,7 @@ fn handleFsMove(app: *App, req: *http.Request, res: *http.Response) !void {
         if (sr.mount != dr.mount) return res.jsonError(400, "moving between storages is not supported yet");
         var ctx = driver.Ctx{ .alloc = a, .tag = sr.mount.mount_path };
         sr.mount.driver.move(&ctx, sr.rel, dr.rel) catch |e| return mapDriverError(res, e);
+        notifyObjsUpdateAfterWrite(app, a, dr.mount, dst_dir);
     }
     try res.jsonOk("null");
 }
@@ -717,6 +1062,7 @@ fn handleFsRemove(app: *App, req: *http.Request, res: *http.Response) !void {
         // the name is exactly the kind of shortcut that deletes the wrong thing.
         const f = r.mount.driver.details(&ctx, r.rel) catch |e| return mapDriverError(res, e);
         r.mount.driver.remove(&ctx, r.rel, f.is_dir) catch |e| return mapDriverError(res, e);
+        notifyObjsUpdateAfterWrite(app, a, r.mount, dir);
     }
     try res.jsonOk("null");
 }
@@ -1005,11 +1351,15 @@ fn handleAdminSettingPut(app: *App, req: *http.Request, res: *http.Response) !vo
         app.admin_user = try app.alloc.dupe(u8, uname);
     }
     // Password is write-only: an empty field means "keep the current one", so
-    // we only act on a genuine new value (>= 6 chars, matching /api/auth/register).
+    // we only act on a genuine new value (>= 6 chars, same floor as the Go build).
     if (v.strAt("password")) |pw| {
         if (pw.len >= 6) {
-            const hash = try sha256Hex(a, pw);
-            try cfg.putZig("admin_password_hash", .{ .string = try ca.dupe(u8, hash) });
+            // 对齐 Go `User.SetPassword`：改密就换 salt，重算 TwoHashPwd。
+            const salt = try randomSalt(ca);
+            const hash = try twoHashPwd(ca, pw, salt);
+            try cfg.putZig("admin_salt", .{ .string = salt });
+            try cfg.putZig("admin_password_hash", .{ .string = hash });
+            app.admin_salt = try app.alloc.dupe(u8, salt);
             app.admin_hash = try app.alloc.dupe(u8, hash);
 
             // A03：改密必须让**已签发**的令牌立刻失效。Go 靠推进 `user.PwdTS`
@@ -1245,9 +1595,9 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
     };
 
     // `total` is what we advertise in `Content-Range`. For local files it is the
-    // on-disk size; for remote it comes from `details` (the link carries no size
-    // for proxied URLs).
-    const total: u64 = if (lk.local_path) |_| lk.local_size else @intCast(@max(f.size, 0));
+    // on-disk size; for in-memory content (Strm 的 `.strm` 文本) it is the text
+    // length; for remote it comes from `details`.
+    const total: u64 = if (lk.local_path) |_| lk.local_size else if (lk.text) |t| t.len else @intCast(@max(f.size, 0));
 
     // A single byte range, if the client asked for one. Malformed/unknown
     // range syntax is ignored (normal 200); a syntactically valid but
@@ -1287,6 +1637,28 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
             res.stream = .{ .ctx = rs, .read = rangeRead, .len = len, .cleanup = rangeCleanup };
         } else {
             res.sendFile(file, total);
+        }
+        return;
+    }
+
+    // In-memory content (`Link.text` — Strm 的 `.strm` 虚拟文件，内容是 URL
+    // 文本；Go `drivers/strm/driver.go:200-204` 用 RangeReader 返回它）。
+    // Content-Type 对齐 Go `http.ServeContent` 对 URL 文本的内容嗅探结果。
+    if (lk.text) |txt| {
+        try res.set("Content-Type", "text/plain; charset=utf-8");
+        try res.set("Accept-Ranges", "bytes");
+        if (range) |rg| {
+            if (rg.start >= total) {
+                res.setStatus(416);
+                try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes */{d}", .{total}));
+                return;
+            }
+            res.setStatus(206);
+            try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ rg.start, rg.end, total }));
+            try res.write(txt[rg.start..rg.end + 1]);
+        } else {
+            res.setStatus(200);
+            try res.write(txt);
         }
         return;
     }
@@ -1444,7 +1816,9 @@ fn writeObj(app: *App, b: *Buf, o: model.Obj, path: []const u8) !void {
     try b.append(",\"modified\":");
     try json.writeString(b, try fmtTime(b.alloc, o.modified));
     try b.append(",\"created\":");
-    try json.writeString(b, try fmtTime(b.alloc, o.created));
+    // Go `Object.CreateTime()` 在 Ctime 为零时回退到 ModTime；不能把零值
+    // 直接输出为空串，否则前端日期格式化会得到 NaN。
+    try json.writeString(b, try fmtTime(b.alloc, if (o.created == 0) o.modified else o.created));
     try b.append(",\"sign\":");
     try json.writeString(b, try signForObj(app, b.alloc, o.is_dir, path));
     try b.append(",\"thumb\":");
@@ -1456,7 +1830,9 @@ fn writeObj(app: *App, b: *Buf, o: model.Obj, path: []const u8) !void {
 /// OpenList serialises timestamps as RFC3339. We emit the same shape so the
 /// frontend's date formatting works.
 fn fmtTime(a: std.mem.Allocator, ts: i64) ![]const u8 {
-    if (ts == 0) return "";
+    // Go `time.Time{}` JSON 序列化为 RFC3339 零值；空串会让前端日期
+    // 格式化器得到 NaN。保留协议形状，所有 Obj 都输出可解析时间。
+    if (ts == 0) return "0001-01-01T00:00:00Z";
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(ts, 0)) };
     const day = es.getEpochDay();
     const ds = es.getDaySeconds();
@@ -1513,8 +1889,44 @@ fn sha256Hex(a: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out;
 }
 
-fn hmacSha256(a: std.mem.Allocator, key: []const u8, msg: []const u8) ![32]u8 {
-    var mac: [32]u8 = undefined;
+/// Go `model.StaticHashSalt`（`internal/model/user.go:24`）。
+/// 前端登录页会先用它把明文口令算成 "static hash"，再 POST 到
+/// `/api/auth/login/hash` —— 所以这个常量必须与 Go **逐字节**一致，
+/// 否则前端永远登不上（这正是 2026-10-13 那次「登录失败」的根因）。
+pub const static_hash_salt = "https://github.com/alist-org/alist";
+
+/// Go `model.StaticHash` = `sha256(password + "-" + StaticHashSalt)`。
+pub fn staticHash(a: std.mem.Allocator, pwd: []const u8) ![]const u8 {
+    const s = try std.fmt.allocPrint(a, "{s}-{s}", .{ pwd, static_hash_salt });
+    return sha256Hex(a, s);
+}
+
+/// Go `model.HashPwd(static, salt)` = `sha256(static + "-" + salt)`。
+pub fn hashPwd(a: std.mem.Allocator, static: []const u8, salt: []const u8) ![]const u8 {
+    const s = try std.fmt.allocPrint(a, "{s}-{s}", .{ static, salt });
+    return sha256Hex(a, s);
+}
+
+/// Go `model.TwoHashPwd(pwd, salt)` = `HashPwd(StaticHash(pwd), salt)`。
+/// **这才是 Go 存进库里的形态**（`User.SetPassword`，`internal/model/user.go:96`）。
+pub fn twoHashPwd(a: std.mem.Allocator, pwd: []const u8, salt: []const u8) ![]const u8 {
+    const st = try staticHash(a, pwd);
+    return hashPwd(a, st, salt);
+}
+
+/// Go `random.String(16)` —— `User.SetPassword` 给每个用户现生成 16 位随机 salt。
+pub fn randomSalt(a: std.mem.Allocator) ![]const u8 {
+    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const out = try a.alloc(u8, 16);
+    var raw: [1]u8 = undefined;
+    for (out) |*c| {
+        rt.io().random(&raw);
+        c.* = letters[raw[0] % letters.len];
+    }
+    return out;
+}
+
+fn hmacSha256(a: std.mem.Allocator, key: []const u8, msg: []const u8) ![32]u8 {    var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, msg, key);
     _ = a;
     return mac;
@@ -1661,7 +2073,31 @@ pub fn mimeFor(name: []const u8) []const u8 {
         .{ ".webp", "image/webp" },
         .{ ".avif", "image/avif" },
         .{ ".bmp", "image/bmp" },
-        // Audio / video.
+        // Audio / video. ⚠️ 这里不能省：浏览器 `<audio>`/`<video>` 只接受
+        // `audio/*`、`video/*` 的响应，`application/octet-stream` 会直接报
+        // "no supported source"。Go 版在 Linux 上靠 mime.TypeByExtension 读
+        // /etc/mime.types 拿到这些类型（Debian 自带），本工程是固定表，必须
+        // 把常见音视频扩展名列全 —— 尤其 .mp3。
+        .{ ".mp3", "audio/mpeg" },
+        .{ ".m4a", "audio/mp4" },
+        .{ ".wma", "audio/x-ms-wma" },
+        .{ ".mka", "audio/x-matroska" },
+        .{ ".mid", "audio/midi" },
+        .{ ".midi", "audio/midi" },
+        .{ ".amr", "audio/amr" },
+        .{ ".ape", "audio/x-ape" },
+        .{ ".m3u", "audio/x-mpegurl" },
+        .{ ".avi", "video/x-msvideo" },
+        .{ ".wmv", "video/x-ms-wmv" },
+        .{ ".asf", "video/x-ms-asf" },
+        .{ ".flv", "video/x-flv" },
+        .{ ".rmvb", "application/vnd.rn-realmedia-vbr" },
+        .{ ".rm", "application/vnd.rn-realmedia" },
+        .{ ".3gp", "video/3gpp" },
+        .{ ".ogv", "video/ogg" },
+        .{ ".m4v", "video/x-m4v" },
+        .{ ".mpg", "video/mpeg" },
+        .{ ".mpeg", "video/mpeg" },
         .{ ".mp4", "video/mp4" },
         .{ ".mkv", "video/x-matroska" },
         .{ ".webm", "video/webm" },
@@ -1804,8 +2240,120 @@ test "time formatting matches RFC3339" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("", try fmtTime(a, 0));
+    try testing.expectEqualStrings("0001-01-01T00:00:00Z", try fmtTime(a, 0));
     try testing.expectEqualStrings("1994-11-06T08:49:37Z", try fmtTime(a, 784111777));
+}
+
+test "mimeFor gives media types the browser audio/video elements accept" {
+    // 回归：浏览器 `<audio>` 拒绝 `application/octet-stream` 的源（报
+    // "no supported source"），所以常见音视频扩展名必须映射到 audio/*、
+    // video/*，对齐 Go 在 Linux 上读 /etc/mime.types 的行为。
+    try testing.expectEqualStrings("audio/mpeg", mimeFor("陶晶莹 - 太委屈.mp3"));
+    try testing.expectEqualStrings("audio/x-ms-wma", mimeFor("萧亚轩 - 下一次恋爱.wma"));
+    try testing.expectEqualStrings("audio/mp4", mimeFor("a.m4a"));
+    try testing.expectEqualStrings("audio/flac", mimeFor("a.flac"));
+    try testing.expectEqualStrings("video/mp4", mimeFor("a.mp4"));
+    try testing.expectEqualStrings("video/x-msvideo", mimeFor("a.avi"));
+    try testing.expectEqualStrings("video/x-ms-wmv", mimeFor("a.wmv"));
+    try testing.expectEqualStrings("video/x-flv", mimeFor("a.flv"));
+    // 大小写不敏感（浏览器发来的扩展名大小写不可控）。
+    try testing.expectEqualStrings("audio/mpeg", mimeFor("A.MP3"));
+    // 真正的未知类型才回落 octet-stream。
+    try testing.expectEqualStrings("application/octet-stream", mimeFor("a.unknownext"));
+}
+
+test "raw_url from fs/get is directly playable: carries sign and a media content-type" {
+    // 回归（2026-10-14 光猫实测两个坑）：
+    // ① raw_url 不带 `?sign=` → 前端播放器直接用它，sign_all 部署下必 401；
+    //    Go 的 `GenerateDownProxyURL`（proxy.go:31-33）生成 /p 链接时是带 sign 的。
+    // ② Content-Type 回落 octet-stream → 浏览器 `<audio>` 报 "no supported source"。
+    // 这条测试把"fs/get 返回的 raw_url 无凭据即可取回且类型可播"整个链路钉死。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "song one.mp3", .data = "0123456789abcdef" });
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var local_drv = @import("drivers/local.zig").Local{
+        .alloc = a,
+        .cfg = .{ .root_folder = root },
+    };
+    const mounts = try a.alloc(Mount, 1);
+    mounts[0] = .{
+        .storage = .{ .id = 1, .mount_path = "/local", .driver = "Local", .addition = "{}" },
+        .driver = driver.asDriver(@import("drivers/local.zig").Local, &local_drv),
+        .mount_path = "/local",
+        .label = "Local",
+    };
+    app.publishMounts(mounts);
+
+    // sign_all=true 的独立 config（与本文件其他 sign 测试同模式）。
+    // ⚠️ `prev` 必须在 `config.load` **之前**取：load 自己就会把单例指到新对象，
+    // 在 load 之后取 prev 等于把单例还原成已 deinit 的对象，后面的测试必 segfault。
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{root});
+    defer testing.allocator.free(cfg_path);
+    const prev = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev);
+    tcfg.sign_all = true;
+    tcfg.link_expiration = 0;
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
+
+    var req = http.Request{
+        .arena = a,
+        .method = "POST",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = hdrs,
+        .body = .{ .memory = "{\"path\":\"/local/song one.mp3\"}" },
+    };
+    const res = try a.create(http.Response);
+    res.* = http.Response.init(a);
+    try handle(&app, &req, res);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const parsed = try json.parse(a, res.buf.slice());
+    const data = parsed.getPath("data").?;
+    const sign_field = data.getPath("sign").?.asStr().?;
+    const raw_url = data.getPath("raw_url").?.asStr().?;
+
+    // ① sign 字段非空且 raw_url 必须带上同一个 sign（前端不再自己拼）。
+    try testing.expect(sign_field.len > 0);
+    try testing.expect(std.mem.startsWith(u8, raw_url, "/p/local/song%20one.mp3?sign="));
+    try testing.expectEqualStrings(sign_field, raw_url["/p/local/song%20one.mp3?sign=".len..]);
+
+    // ② 无凭据 + Range 直接取 raw_url：必须放行且 Content-Type 可播。
+    // 服务器收到请求后会把路径 percent-decode（http.zig 的 `url.decode`），
+    // 签名也是对**解码后**的路径校验的 —— 所以这里 .path 必须是解码形态。
+    const qmark = std.mem.indexOfScalar(u8, raw_url, '?').?;
+    var play = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/p/local/song one.mp3",
+        .target = "/p/local/song%20one.mp3",
+        .query = raw_url[qmark + 1 ..],
+        .headers = try a.dupe(Header, &.{.{ .name = "Range", .value = "bytes=0-3" }}),
+    };
+    const play_res = try a.create(http.Response);
+    play_res.* = http.Response.init(a);
+    try handle(&app, &play, play_res);
+    try testing.expectEqual(@as(u16, 206), play_res.status);
+    var ctype: ?[]const u8 = null;
+    for (play_res.headers.slice()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) ctype = h.value;
+    }
+    try testing.expectEqualStrings("audio/mpeg", ctype.?);
 }
 
 test "Range parser supports closed, open-ended and suffix forms" {
@@ -1876,6 +2424,16 @@ fn routingApp(a: std.mem.Allocator, fe: frontend_mod.Frontend) App {
 
 fn doRequest(app: *App, a: std.mem.Allocator, method: []const u8, path: []const u8) !*http.Response {
     var req = http.Request{ .arena = a, .method = method, .path = path, .target = path };
+    const res = try a.create(http.Response);
+    res.* = http.Response.init(a);
+    try handle(app, &req, res);
+    return res;
+}
+
+/// Like `doRequest`, but lets a test set the query string and headers, so one
+/// sweep can reach every registered endpoint.
+fn doRequestWith(app: *App, a: std.mem.Allocator, method: []const u8, path: []const u8, query: []const u8, headers: []Header) !*http.Response {
+    var req = http.Request{ .arena = a, .method = method, .path = path, .query = query, .target = path, .headers = headers };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
     try handle(app, &req, res);
@@ -2156,6 +2714,384 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         try handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 401), res.status);
     }
+}
+
+test "public settings body is strict JSON (regression: stray closing brace)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var req = http.Request{ .arena = a, .method = "GET", .path = "/api/public/settings", .target = "/api/public/settings" };
+    const res = try a.create(http.Response);
+    res.* = http.Response.init(a);
+    try handle(&app, &req, res);
+    try testing.expectEqual(@as(u16, 200), res.status);
+
+    // 回归：收尾的 `append("}}}")` 是笔误。`append` 写**原始字节**，不做 `print`
+    // 那样的 `{{`/`}}` 转义，于是 body 末尾多出一个 `}`（337 字节里只有前 336 是
+    // 合法 JSON）。后果不是 500，而是前端静默出错：axios 的 `JSON.parse` 抛错后
+    // 被 `silentJSONParsing` 降级成字符串，`e.code === 200` 永远为假，首页直接
+    // 显示「获取设置失败： Undefined」。`json.parse` 对尾随内容报 `InvalidSyntax`，
+    // 正好把这个 bug 钉死。
+    const body = res.buf.slice();
+    const parsed = try json.parse(a, body);
+    try testing.expectEqual(@as(i64, 200), parsed.getPath("code").?.asInt().?);
+    switch (parsed.getPath("data").?.*) {
+        .object => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "every JSON endpoint emits strict, parseable JSON" {
+    // 系统性补丁：本工程的 API 响应是**手拼字符串**（不像 Go 版走 struct/map
+    // 序列化），一处括号写错就产出非法 JSON；而 axios 会把 `JSON.parse` 的失败
+    // 静默降级成字符串，前端于是只报一句毫无线索的「获取设置失败： Undefined」。
+    // 这里把**所有**已注册的 JSON 端点跑一遍，逐个用严格解析器校验（`json.parse`
+    // 对尾随内容报 InvalidSyntax，正是它抓出了 public/settings 多出的那个 '}'）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    // /api/admin/setting* 会读 config 单例；测试里没 load 过就直接 panic。
+    // 按 sign 测试的做法 load 一份临时配置再注入，退出时还原进入前的单例。
+    // 注意 `config.load` **自己就会**把单例指到新对象，所以必须在 load 之前
+    // 取 `prev`，否则还原的是新对象、`deinit` 之后单例悬空，后面读 config 的
+    // 测试会 segfault。
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(cfg_dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{cfg_dir});
+    defer testing.allocator.free(cfg_path);
+    const prev_cfg = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev_cfg);
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = auth };
+
+    // 1) 公共 GET
+    for ([_][]const u8{
+        "/api/public/settings",
+        "/api/public/archive_extensions",
+    }) |p| {
+        const res = try doRequest(&app, a, "GET", p);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        _ = try json.parse(a, res.buf.slice());
+    }
+    {
+        const res = try doRequestWith(&app, a, "GET", "/api/public/offline_download_tools", "path=%2F", &.{});
+        try testing.expectEqual(@as(u16, 200), res.status);
+        _ = try json.parse(a, res.buf.slice());
+    }
+
+    // 2) 认证 GET
+    for ([_][]const u8{
+        "/api/me",
+        "/api/admin/storage",
+        "/api/admin/storage/list",
+        "/api/admin/driver/names",
+        "/api/admin/driver/list",
+        "/api/admin/setting",
+        "/api/admin/setting/list",
+        "/api/admin/setting/default",
+        "/api/task/upload/undone",
+        "/api/task/upload/done",
+        "/api/task/copy/undone",
+        "/api/task/copy/done",
+        "/api/task/move/undone",
+        "/api/task/offline_download/undone",
+    }) |p| {
+        const res = try doRequestWith(&app, a, "GET", p, "", hdrs);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        _ = try json.parse(a, res.buf.slice());
+    }
+
+    // 3) setting/get 与 setting/list 都走 query 参数。`group=0` 在 Go
+    // `handles.ListSettings` 中是有效筛选值；本构建当前没有 group 0 的配置项，
+    // 因而应得到合法的空数组，而不是 404 或忽略筛选。
+    {
+        const res = try doRequestWith(&app, a, "GET", "/api/admin/setting/get", "key=site_title", hdrs);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        _ = try json.parse(a, res.buf.slice());
+    }
+    {
+        const res = try doRequestWith(&app, a, "GET", "/api/admin/setting/list", "group=0", hdrs);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const parsed = try json.parse(a, res.buf.slice());
+        const items = parsed.getPath("data").?.asArray().?;
+        try testing.expectEqual(@as(usize, 0), items.len);
+    }
+
+    // 4) 认证 POST（空 body ⇒ 空对象 ⇒ 无挂载 ⇒ JSON 错误包，也必须是合法 JSON）
+    for ([_][]const u8{
+        "/api/fs/list",
+        "/api/fs/get",
+        "/api/fs/dirs",
+        "/api/fs/mkdir",
+        "/api/fs/rename",
+        "/api/fs/move",
+        "/api/fs/copy",
+        "/api/fs/remove",
+        "/api/fs/put",
+        "/api/fs/archive/list",
+    }) |p| {
+        const res = try doRequestWith(&app, a, "POST", p, "", hdrs);
+        _ = try json.parse(a, res.buf.slice());
+    }
+
+    // 5) 未注册的 /api/* ⇒ JSON 404
+    {
+        const res = try doRequest(&app, a, "GET", "/api/nope");
+        try testing.expectEqual(@as(u16, 404), res.status);
+        _ = try json.parse(a, res.buf.slice());
+    }
+}
+
+test "public settings carries the keys the frontend actually reads" {
+    // 回归：曾经只返回 10 个自造字段（initial_done / api / cdn / token_expires_in …），
+    // 前端真正读的键一个都没有 —— 表现就是首页 logo 拿到空串、`<img src="">`。
+    // 这里把前端代码实际引用的键逐个钉住（清单来自 4.2.6 的 dist：把每个
+    // `(\`key\`)` 取值点扫出来），并强制值必须是字符串。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    const res = try doRequest(&app, a, "GET", "/api/public/settings");
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const parsed = try json.parse(a, res.buf.slice());
+    const data = parsed.getPath("data").?.object;
+
+    const required = [_][]const u8{
+        "version",              "site_title",             "announcement",
+        "pagination_type",      "logo",                   "favicon",
+        "main_color",           "home_icon",              "share_icon",
+        "home_container",       "settings_layout",        "show_disk_usage_in_plain_text",
+        "audio_cover",          "audio_autoplay",         "video_autoplay",
+        "preview_download_by_default", "preview_archives_by_default",
+        "share_preview_download_by_default", "share_preview_archives_by_default",
+        "readme_autorender",    "filter_readme_scripts",  "hide_files",
+        "package_download",     "share_preview",          "share_archive_preview",
+        "share_summary_content", "search_index",          "sso_login_enabled",
+        "sso_login_platform",   "sso_compatibility_mode", "ldap_login_enabled",
+        "ldap_login_tips",      "multipart_enabled",
+    };
+    for (required) |k| {
+        const v = data.get(k) orelse return error.MissingPublicSettingKey;
+        switch (v.*) {
+            .string => {},
+            // Go 侧是 `map[string]string`；前端按字符串判布尔/数字
+            // （`t === 'true'`、`Number(t)`），给原生 bool/int 会静默判错。
+            else => return error.PublicSettingValueMustBeString,
+        }
+    }
+
+    // logo 尤其不能为空 —— 空串渲染出来就是 `<img src="">`。
+    try testing.expect(data.get("logo").?.asStr().?.len > 0);
+    try testing.expect(data.get("site_title").?.asStr().?.len > 0);
+}
+
+test "fs list carries the envelope fields the frontend reads" {
+    // 回归：`readme`/`header`/`write`/`write_content_bypass`/`provider` 少一个，
+    // 前端 `setWrite(undefined)` 就会把目录判成只读 —— 上传/新建按钮整片消失。
+    // （测试环境无挂载，"/" 走 `listRoot`，信封字段与挂载目录完全一致。）
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = auth };
+
+    const res = try doRequestWith(&app, a, "POST", "/api/fs/list", "", hdrs);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const parsed = try json.parse(a, res.buf.slice());
+    const data = parsed.getPath("data").?.object;
+    for ([_][]const u8{
+        "content", "total", "readme", "header",
+        "write",   "write_content_bypass", "provider",
+    }) |k| {
+        if (data.get(k) == null) return error.MissingFsListField;
+    }
+    // 单管理员构建 ⇒ 目录可写，前端据此显示上传/新建。
+    try testing.expect(data.get("write").?.asBool() != null and data.get("write").?.asBool().?);
+}
+
+test "init_status drives the first-run wizard and init/setup creates the admin" {
+    // 回归：`/api/public/init_status` 缺失时前端**永远**不跳 `/@init` ——
+    // App.tsx 里这个请求的失败回调被注释掉了（静默吞错），`initialized` 保持
+    // 默认 true，用户看不到任何注册入口，只能拿已有账号登录。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    // init/setup 会写 config 单例；`prev` 必须在 load **之前**取
+    // （`config.load` 自己就会把单例指过去）。
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(cfg_dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{cfg_dir});
+    defer testing.allocator.free(cfg_path);
+    const prev_cfg = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev_cfg);
+
+    // 1) 未初始化（admin_hash 为空）⇒ initialized:false
+    {
+        const res = try doRequest(&app, a, "GET", "/api/public/init_status");
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const parsed = try json.parse(a, res.buf.slice());
+        try testing.expectEqual(false, parsed.getPath("data.initialized").?.asBool().?);
+    }
+
+    // 2) init/setup 建管理员（Go 侧密码下限是 4）
+    {
+        var req = http.Request{
+            .arena = a,
+            .method = "POST",
+            .path = "/api/public/init/setup",
+            .target = "/api/public/init/setup",
+            .body = .{ .memory = "{\"username\":\"admin\",\"password\":\"test-pw-1234\",\"site_title\":\"Zig Site\"}" },
+        };
+        const res = try a.create(http.Response);
+        res.* = http.Response.init(a);
+        try handle(&app, &req, res);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expect(app.admin_hash.len > 0);
+        try testing.expectEqualStrings("admin", app.admin_user);
+    }
+
+    // 3) 已初始化后再调 ⇒ 400（Go：`system has already been initialized`）
+    {
+        var req = http.Request{
+            .arena = a,
+            .method = "POST",
+            .path = "/api/public/init/setup",
+            .target = "/api/public/init/setup",
+            .body = .{ .memory = "{\"username\":\"x\",\"password\":\"1234\"}" },
+        };
+        const res = try a.create(http.Response);
+        res.* = http.Response.init(a);
+        try handle(&app, &req, res);
+        try testing.expectEqual(@as(u16, 400), res.status);
+    }
+
+    // 4) 现在 init_status 应报 initialized:true
+    {
+        const res = try doRequest(&app, a, "GET", "/api/public/init_status");
+        const parsed = try json.parse(a, res.buf.slice());
+        try testing.expectEqual(true, parsed.getPath("data.initialized").?.asBool().?);
+    }
+}
+
+test "login/hash accepts the static hash the frontend actually sends" {
+    // 回归：前端登录页 POST 的是 `/api/auth/login/hash`（server/router.go:75），
+    // body 里的 password 是 `StaticHash(明文)`。这个端点曾经缺失 ⇒ 前端恒登不上，
+    // 而 curl 直接打 `/auth/login` 却是通的 —— 「curl 通过」不等于「前端能登录」。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    // 造一个与 Go 同形的管理员：salt + `TwoHashPwd`。
+    const salt = "abcdefghijklmnop";
+    app.admin_user = "admin";
+    app.admin_salt = salt;
+    app.admin_hash = try twoHashPwd(a, "hunter2", salt);
+
+    const post = struct {
+        fn call(app_: *App, a_: std.mem.Allocator, path: []const u8, body: []const u8) !*http.Response {
+            var req = http.Request{ .arena = a_, .method = "POST", .path = path, .target = path, .body = .{ .memory = body } };
+            const res = try a_.create(http.Response);
+            res.* = http.Response.init(a_);
+            try handle(app_, &req, res);
+            return res;
+        }
+    }.call;
+
+    // 1) 前端路径：发 StaticHash，必须换到 token
+    const static = try staticHash(a, "hunter2");
+    const body_hash = try std.fmt.allocPrint(a, "{{\"username\":\"admin\",\"password\":\"{s}\",\"otp_code\":\"\"}}", .{static});
+    const res_hash = try post(&app, a, "/api/auth/login/hash", body_hash);
+    try testing.expectEqual(@as(u16, 200), res_hash.status);
+    try testing.expect((try json.parse(a, res_hash.buf.slice())).getPath("data.token") != null);
+
+    // 2) 明文接口（Go 的 `ValidatePwd` 会先做一次 StaticHash）
+    const res_plain = try post(&app, a, "/api/auth/login", "{\"username\":\"admin\",\"password\":\"hunter2\"}");
+    try testing.expectEqual(@as(u16, 200), res_plain.status);
+
+    // 3) 错口令 / 错用户名必须 400
+    try testing.expectEqual(@as(u16, 400), (try post(&app, a, "/api/auth/login", "{\"username\":\"admin\",\"password\":\"nope\"}")).status);
+    try testing.expectEqual(@as(u16, 400), (try post(&app, a, "/api/auth/login/hash", "{\"username\":\"root\",\"password\":\"x\"}")).status);
+}
+
+test "fs/get / returns the virtual root like Go" {
+    // 回归：Go `internal/fs/get.go:25-30` 对 `/` 返回虚拟根对象而不是报错。
+    // 前端 Layout 进首页第一个请求就是 `fs/get /`；此前我们回 404
+    // "storage not found"，首页直接显示 404（管理后台走 storage/list 所以正常）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = auth };
+
+    // `doRequestWith` 的第 5 参是 **query** 不是 body，所以这里直接构造 Request
+    // （带 JSON body）—— 之前把 body 塞进了 query，fs/get 收到空 body 直接 return，
+    // 响应体为空，测试在 getPath 处 null panic。
+    var req = http.Request{
+        .arena = a,
+        .method = "POST",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = hdrs,
+        .body = .{ .memory = "{\"path\":\"/\"}" },
+    };
+    const res = try a.create(http.Response);
+    res.* = http.Response.init(a);
+    try handle(&app, &req, res);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const parsed = try json.parse(a, res.buf.slice());
+    try testing.expectEqualStrings("root", parsed.getPath("data.name").?.asStr().?);
+    try testing.expectEqual(true, parsed.getPath("data.is_dir").?.asBool().?);
+    try testing.expectEqualStrings("", parsed.getPath("data.provider").?.asStr().?);
 }
 
 test "ctEqual rejects mismatched lengths without narrowing the difference" {

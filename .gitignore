@@ -31,6 +31,7 @@ output/
 /daemon/
 /public/dist/*
 !/public/dist/README.md
+/openlist-zig/.zig-cache/
 
 .VSCodeCounter
 *.syso

@@ -129,6 +129,11 @@ pub const Link = struct {
     local_path: ?[]const u8 = null,
     /// Size of `local_path`, so the response can carry Content-Length.
     local_size: u64 = 0,
+    /// In-memory content to serve as the file body (Strm 的 `.strm` 虚拟文件：
+    /// Go `drivers/strm/driver.go:200-204` 用 RangeReader 返回 URL 文本）。
+    /// 设置了它，HTTP 层直接按内存切片服务（支持 Range），与 `OnlyProxy`
+    /// 语义配套 —— 持有它的驱动同时必须置 `proxy = true`。
+    text: ?[]const u8 = null,
 };
 
 pub const LinkArgs = struct {
